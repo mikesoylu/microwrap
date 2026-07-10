@@ -72,7 +72,7 @@ HOST_PID=$outside_pid "$WRAP" -- /bin/sh -c '
     set -eu
     test "$$" = 2
     test "$PPID" = 1
-    test "$(cat /proc/1/comm)" = microwrap
+    case "$(cat /proc/1/comm)" in microwrap*) ;; *) exit 1 ;; esac
     test ! -e "/proc/$HOST_PID/status"
     if kill -0 "$HOST_PID" 2>/dev/null; then
         exit 1
