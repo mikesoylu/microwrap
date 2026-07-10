@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, test, and release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Enable ARM64 containers
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Build static release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build dist
+
+          while read -r arch platform machine; do
+            output="/work/build/microwrap-linux-${arch}"
+            docker run --rm \
+              --platform "${platform}" \
+              --volume "${GITHUB_WORKSPACE}:/work" \
+              --workdir /work \
+              --env "OUTPUT=${output}" \
+              --env "EXPECTED_MACHINE=${machine}" \
+              alpine:3.22 \
+              sh -euc '
+                apk add --no-cache build-base file linux-headers
+                test "$(uname -m)" = "$EXPECTED_MACHINE"
+                make release LDFLAGS=-static
+                file microwrap | grep -q "statically linked"
+                install -m 0755 microwrap "$OUTPUT"
+              '
+          done <<'EOF'
+          amd64 linux/amd64 x86_64
+          arm64 linux/arm64 aarch64
+          EOF
+
+      - name: Test on Debian and Amazon Linux
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while read -r arch platform; do
+            wrap="/work/build/microwrap-linux-${arch}"
+            for image in debian:bookworm-slim amazonlinux:2023; do
+              docker run --rm --privileged \
+                --platform "${platform}" \
+                --volume "${GITHUB_WORKSPACE}:/work:ro" \
+                --workdir /work \
+                --env "WRAP=${wrap}" \
+                "${image}" \
+                /bin/sh -euc '
+                  if command -v dnf >/dev/null 2>&1; then
+                    dnf install -y diffutils >/dev/null
+                  fi
+                  exec /work/tests/smoke.sh
+                '
+            done
+          done <<'EOF'
+          amd64 linux/amd64
+          arm64 linux/arm64
+          EOF
+
+      - name: Package artifacts
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          for arch in amd64 arm64; do
+            package="microwrap-${VERSION}-linux-${arch}"
+            mkdir -p "build/${package}"
+            install -m 0755 "build/microwrap-linux-${arch}" \
+              "build/${package}/microwrap"
+            install -m 0644 README.md "build/${package}/README.md"
+            tar -C build -czf "dist/${package}.tar.gz" "${package}"
+          done
+
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz \
+            dist/SHA256SUMS \
+            --verify-tag \
+            --generate-notes \
+            --title "microwrap ${GITHUB_REF_NAME}"

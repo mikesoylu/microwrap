@@ -1,2 +1,4 @@
 /microwrap
+/build/
+/dist/
 *.o

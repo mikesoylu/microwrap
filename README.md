@@ -29,6 +29,28 @@ make release RELEASE_MAX_PAGE_SIZE=65536
 
 The only build requirement is a Linux C toolchain and libc headers.
 
+## Releases
+
+Pushing a tag such as `v0.1.0` builds and publishes static Linux release
+archives for EC2 `amd64` instances and ARM64/Graviton instances. The binaries
+are tested on Debian and Amazon Linux 2023 and do not depend on the target
+system's libc.
+
+Release assets are named:
+
+```text
+microwrap-VERSION-linux-amd64.tar.gz
+microwrap-VERSION-linux-arm64.tar.gz
+SHA256SUMS
+```
+
+For example, create a release with:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Usage
 
 ```text
