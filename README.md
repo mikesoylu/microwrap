@@ -76,7 +76,7 @@ Runtime options:
   --no-defaults        Disable automatic mounts, account files, and env.
   --no-userns          Do not create a user namespace. Requires CAP_SYS_ADMIN.
   --share-pid          Share the caller's PID namespace and procfs.
-  --help               Show usage.
+  --help               Print the online usage URL.
 ```
 
 By default, `microwrap` creates a user namespace and maps the caller's numeric

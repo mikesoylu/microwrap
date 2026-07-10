@@ -31,6 +31,16 @@ if [ -e /lib64 ]; then
     base_args="$base_args --ro-bind /lib64 /lib64"
 fi
 
+echo "documentation and diagnostics"
+docs_url=https://github.com/mikesoylu/microwrap#usage
+test "$("$WRAP" --help)" = "$docs_url"
+if "$WRAP" --unknown >"$tmp/unknown.out" 2>"$tmp/unknown.err"; then
+    echo "unknown option unexpectedly succeeded" >&2
+    exit 1
+fi
+test ! -s "$tmp/unknown.out"
+grep -Fx "microwrap: unknown option: --unknown" "$tmp/unknown.err" >/dev/null
+
 echo "default admin environment"
 EXPECTED_UID=$caller_uid EXPECTED_GID=$caller_gid "$WRAP" -- /bin/sh -c '
     set -eu
@@ -52,6 +62,7 @@ EXPECTED_UID=$caller_uid EXPECTED_GID=$caller_gid "$WRAP" -- /bin/sh -c '
     test -d "$XDG_CONFIG_HOME"
     touch "$HOME/home-write" "$TMPDIR/tmp-write"
 '
+"$WRAP" -- /bin/sh -c 'test ! -e /proc/self/fd/9' 9>"$tmp/inherited-fd"
 if [ -x /bin/bash ]; then
     EXPECTED_UID=$caller_uid EXPECTED_GID=$caller_gid "$WRAP" -- /bin/bash -c '
         test "$UID" = "$EXPECTED_UID"

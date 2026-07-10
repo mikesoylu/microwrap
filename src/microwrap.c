@@ -4,7 +4,6 @@
 #error "microwrap is Linux-only and requires Linux namespace/mount APIs"
 #endif
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -14,11 +13,11 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -69,21 +68,163 @@ struct config {
     bool no_defaults;
 };
 
-static void die(const char *fmt, ...)
+struct text_buffer {
+    char *data;
+    size_t len;
+    size_t cap;
+    bool truncated;
+};
+
+static void text_add_char(struct text_buffer *buf, char value)
 {
+    if (buf->len + 1 < buf->cap)
+        buf->data[buf->len++] = value;
+    else
+        buf->truncated = true;
+}
+
+static void text_add_string(struct text_buffer *buf, const char *value)
+{
+    if (!value)
+        value = "(null)";
+    while (*value)
+        text_add_char(buf, *value++);
+}
+
+static void text_add_unsigned(struct text_buffer *buf, unsigned long value)
+{
+    char digits[3 * sizeof(value)];
+    size_t len = 0;
+
+    do {
+        digits[len++] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value);
+    while (len > 0)
+        text_add_char(buf, digits[--len]);
+}
+
+/* Only the conversions used below are implemented to avoid libc printf code. */
+static bool text_vformat(char *data, size_t cap, const char *fmt, va_list ap)
+{
+    struct text_buffer buf = { .data = data, .cap = cap };
+
+    while (*fmt) {
+        bool long_value = false;
+
+        if (*fmt != '%') {
+            text_add_char(&buf, *fmt++);
+            continue;
+        }
+        fmt++;
+        if (*fmt == 'l') {
+            long_value = true;
+            fmt++;
+        }
+
+        switch (*fmt) {
+        case 's':
+            text_add_string(&buf, va_arg(ap, const char *));
+            break;
+        case 'd': {
+            int value = va_arg(ap, int);
+            unsigned int magnitude;
+
+            if (value < 0) {
+                text_add_char(&buf, '-');
+                magnitude = 0U - (unsigned int)value;
+            } else {
+                magnitude = (unsigned int)value;
+            }
+            text_add_unsigned(&buf, magnitude);
+            break;
+        }
+        case 'u':
+            text_add_unsigned(&buf, long_value ? va_arg(ap, unsigned long)
+                                                : va_arg(ap, unsigned int));
+            break;
+        case '%':
+            text_add_char(&buf, '%');
+            break;
+        case '\0':
+            text_add_char(&buf, '%');
+            continue;
+        default:
+            text_add_char(&buf, '%');
+            if (long_value)
+                text_add_char(&buf, 'l');
+            text_add_char(&buf, *fmt);
+            break;
+        }
+        fmt++;
+    }
+
+    if (cap)
+        data[buf.len < cap ? buf.len : cap - 1] = '\0';
+    return !buf.truncated;
+}
+
+static void write_output(int fd, const char *data)
+{
+    size_t len = strlen(data);
+
+    while (len > 0) {
+        ssize_t written = write(fd, data, len);
+
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            _exit(1);
+        }
+        if (written == 0)
+            _exit(1);
+        data += written;
+        len -= (size_t)written;
+    }
+}
+
+static _Noreturn void die(const char *fmt, ...)
+{
+    char message[1024];
     va_list ap;
 
-    fprintf(stderr, "microwrap: ");
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    text_vformat(message, sizeof(message), fmt, ap);
     va_end(ap);
-    fputc('\n', stderr);
-    exit(1);
+    write_output(STDERR_FILENO, "microwrap: ");
+    write_output(STDERR_FILENO, message);
+    write_output(STDERR_FILENO, "\n");
+    _exit(1);
 }
 
 static void die_errno(const char *what)
 {
-    die("%s: %s", what, strerror(errno));
+    int error = errno;
+
+    die("%s: errno %d", what, error);
+}
+
+static void format_text(char *data, size_t cap, const char *fmt, ...)
+{
+    va_list ap;
+    bool complete;
+
+    va_start(ap, fmt);
+    complete = text_vformat(data, cap, fmt, ap);
+    va_end(ap);
+    if (!complete)
+        die("internal formatted value is too long");
+}
+
+static void warn_remove(const char *path)
+{
+    char message[1024];
+    int error = errno;
+
+    format_text(message, sizeof(message),
+                "microwrap: warning: failed to remove %s: errno %d\n",
+                path, error);
+    write_output(STDERR_FILENO, message);
 }
 
 static void *xrealloc(void *ptr, size_t size)
@@ -170,7 +311,7 @@ static void finalize_config(struct config *cfg)
         cfg->home = malloc(len);
         if (!cfg->home)
             die_errno("malloc");
-        snprintf(cfg->home, len, "/home/%s", cfg->user);
+        format_text(cfg->home, len, "/home/%s", cfg->user);
     }
 
     len = strlen(cfg->home);
@@ -183,30 +324,10 @@ static void finalize_config(struct config *cfg)
         cfg->workdir = cfg->no_defaults ? "/" : cfg->home;
 }
 
-static void usage(FILE *out)
+static _Noreturn void show_docs(int fd, int status)
 {
-    fprintf(out,
-        "usage: microwrap [options] -- command [args...]\n"
-        "\n"
-        "filesystem options:\n"
-        "  --bind SRC DST       bind-mount SRC read-write at absolute path DST\n"
-        "  --ro-bind SRC DST    bind-mount SRC read-only at absolute path DST\n"
-        "  --tmpfs DST          mount an empty tmpfs at absolute path DST\n"
-        "  --proc DST           mount procfs at absolute path DST\n"
-        "  --dir DST            create a directory at absolute path DST\n"
-        "  --symlink TARGET DST create symlink DST -> TARGET inside the wrapper\n"
-        "\n"
-        "runtime options:\n"
-        "  --user NAME          cosmetic account name; defaults to admin\n"
-        "  --home DIR           home path; defaults to /home/NAME\n"
-        "  --chdir DIR          chdir before exec; defaults to the home path\n"
-        "  --setenv NAME VALUE  set an environment variable before exec\n"
-        "  --unsetenv NAME      remove an environment variable before exec\n"
-        "  --clearenv           clear inherited variables before adding defaults\n"
-        "  --no-defaults        disable automatic mounts, account files, and env\n"
-        "  --no-userns          skip user namespace setup; requires CAP_SYS_ADMIN\n"
-        "  --share-pid          share the caller's PID namespace and procfs\n"
-        "  --help               show this help\n");
+    write_output(fd, "https://github.com/mikesoylu/microwrap#usage\n");
+    _exit(status);
 }
 
 static char **parse_args(int argc, char **argv, struct config *cfg)
@@ -307,17 +428,14 @@ static char **parse_args(int argc, char **argv, struct config *cfg)
         } else if (strcmp(arg, "--share-pid") == 0) {
             cfg->share_pid = true;
         } else if (strcmp(arg, "--help") == 0) {
-            usage(stdout);
-            exit(0);
+            show_docs(STDOUT_FILENO, 0);
         } else {
             die("unknown option: %s", arg);
         }
     }
 
-    if (i >= argc) {
-        usage(stderr);
-        exit(1);
-    }
+    if (i >= argc)
+        show_docs(STDERR_FILENO, 1);
 
     return &argv[i];
 }
@@ -485,11 +603,11 @@ static void mount_bind(const char *src, const char *target, bool readonly)
     ensure_bind_target(target, &st);
 
     if (mount(src, target, NULL, MS_BIND, NULL) < 0)
-        die("bind mount %s to %s: %s", src, target, strerror(errno));
+        die("bind mount %s to %s: errno %d", src, target, errno);
 
     if (readonly && mount(NULL, target, NULL,
                           MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0)
-        die("remount %s read-only: %s", target, strerror(errno));
+        die("remount %s read-only: errno %d", target, errno);
 }
 
 static void mount_tmpfs_with_options(const char *target, const char *options)
@@ -576,7 +694,7 @@ static void write_map(const char *path, unsigned long inside_id, unsigned long o
 {
     char buf[128];
 
-    snprintf(buf, sizeof(buf), "%lu %lu 1\n", inside_id, outside_id);
+    format_text(buf, sizeof(buf), "%lu %lu 1\n", inside_id, outside_id);
     write_file(path, buf, false);
 }
 
@@ -655,30 +773,21 @@ static void ensure_stdio(void)
 
 static void close_extra_fds(void)
 {
-    DIR *dir = opendir("/proc/self/fd");
+    struct rlimit limit;
+    rlim_t max_fd;
 
-    if (dir) {
-        int keep = dirfd(dir);
-        struct dirent *entry;
-
-        while ((entry = readdir(dir))) {
-            char *end = NULL;
-            long fd;
-
-            errno = 0;
-            fd = strtol(entry->d_name, &end, 10);
-            if (errno || !end || *end || fd <= 2 || fd == keep)
-                continue;
-            close((int)fd);
-        }
-        closedir(dir);
+#ifdef SYS_close_range
+    if (syscall(SYS_close_range, 3U, ~0U, 0U) == 0)
         return;
-    }
+#endif
 
-    long max_fd = sysconf(_SC_OPEN_MAX);
-    if (max_fd < 0 || max_fd > 1024 * 1024)
+    if (getrlimit(RLIMIT_NOFILE, &limit) < 0)
         max_fd = 1024 * 1024;
-    for (long fd = 3; fd < max_fd; fd++)
+    else
+        max_fd = limit.rlim_cur;
+    if (max_fd > 1024 * 1024)
+        max_fd = 1024 * 1024;
+    for (rlim_t fd = 3; fd < max_fd; fd++)
         close((int)fd);
 }
 
@@ -786,7 +895,7 @@ static char *append_path(const char *base, const char *suffix)
 
     if (!path)
         die_errno("malloc");
-    snprintf(path, len, "%s%s", base, suffix);
+    format_text(path, len, "%s%s", base, suffix);
     return path;
 }
 
@@ -796,7 +905,7 @@ static char *runtime_dir(const struct config *cfg)
 
     if (!path)
         die_errno("malloc");
-    snprintf(path, 64, "/run/user/%lu", (unsigned long)cfg->uid);
+    format_text(path, 64, "/run/user/%lu", (unsigned long)cfg->uid);
     return path;
 }
 
@@ -926,7 +1035,7 @@ static void default_recursive_bind_path(const struct config *cfg,
     target = join_under_root(root, path);
     ensure_bind_target(target, &st);
     if (mount(path, target, NULL, MS_BIND | MS_REC, NULL) < 0)
-        die("recursive bind mount %s to %s: %s", path, target, strerror(errno));
+        die("recursive bind mount %s to %s: errno %d", path, target, errno);
     free(target);
 }
 
@@ -935,7 +1044,7 @@ static void remount_bind_readonly(const char *target)
     if (mount(NULL, target, NULL,
               MS_BIND | MS_REMOUNT | MS_RDONLY |
               MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0)
-        die("remount %s read-only: %s", target, strerror(errno));
+        die("remount %s read-only: errno %d", target, errno);
 }
 
 static void mask_default_path(const struct config *cfg, const char *root,
@@ -959,10 +1068,10 @@ static void mask_default_path(const struct config *cfg, const char *root,
         if (mount("tmpfs", target, "tmpfs",
                   MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
                   "mode=000,size=0") < 0)
-            die("mask %s: %s", target, strerror(errno));
+            die("mask %s: errno %d", target, errno);
     } else {
         if (mount("/dev/null", target, NULL, MS_BIND, NULL) < 0)
-            die("mask %s: %s", target, strerror(errno));
+            die("mask %s: errno %d", target, errno);
         remount_bind_readonly(target);
     }
     free(target);
@@ -988,7 +1097,7 @@ static void make_default_path_readonly(const struct config *cfg,
     if (S_ISDIR(st.st_mode))
         flags |= MS_REC;
     if (mount(target, target, NULL, flags, NULL) < 0)
-        die("bind %s read-only: %s", target, strerror(errno));
+        die("bind %s read-only: errno %d", target, errno);
     remount_bind_readonly(target);
     free(target);
 }
@@ -1042,11 +1151,12 @@ static void setup_account_files(const struct config *cfg, const char *root)
 
     if (!passwd || !group)
         die_errno("malloc");
-    snprintf(passwd, passwd_len, "%s:x:%lu:%lu:Microwrap User:%s:/bin/sh\n",
-             cfg->user, (unsigned long)cfg->uid, (unsigned long)cfg->gid,
-             cfg->home);
-    snprintf(group, group_len, "%s:x:%lu:\n", cfg->user,
-             (unsigned long)cfg->gid);
+    format_text(passwd, passwd_len,
+                "%s:x:%lu:%lu:Microwrap User:%s:/bin/sh\n",
+                cfg->user, (unsigned long)cfg->uid, (unsigned long)cfg->gid,
+                cfg->home);
+    format_text(group, group_len, "%s:x:%lu:\n", cfg->user,
+                (unsigned long)cfg->gid);
 
     if (!target_is_overridden(cfg, "/etc/passwd")) {
         target = join_under_root(root, "/etc/passwd");
@@ -1226,7 +1336,7 @@ static void setup_environment(const struct config *cfg)
         prompt = malloc(prompt_len);
         if (!prompt)
             die_errno("malloc");
-        snprintf(prompt, prompt_len, "%s$ ", cfg->user);
+        format_text(prompt, prompt_len, "%s$ ", cfg->user);
         set_env("PS1", prompt);
         free(prompt);
     }
@@ -1318,6 +1428,12 @@ static int wait_status_code(int status)
     return 1;
 }
 
+static pid_t fork_process(void)
+{
+    /* Microwrap is single-threaded, so libc's fork coordination is unnecessary. */
+    return (pid_t)syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+}
+
 static void forward_pending_signal(pid_t child)
 {
     int signal_number = pending_signal;
@@ -1326,7 +1442,7 @@ static void forward_pending_signal(pid_t child)
         return;
     pending_signal = 0;
     if (kill(child, signal_number) < 0 && errno != ESRCH)
-        die("forward signal %d: %s", signal_number, strerror(errno));
+        die("forward signal %d: errno %d", signal_number, errno);
 }
 
 static int supervise_process(pid_t child, bool reap_orphans)
@@ -1391,7 +1507,7 @@ static int pid_namespace_main(const struct config *cfg, const char *root,
     pid_t pid;
 
     setup_sandbox(cfg, root);
-    pid = fork();
+    pid = fork_process();
     if (pid < 0)
         die_errno("fork command");
     if (pid == 0)
@@ -1410,7 +1526,7 @@ static int child_main(const struct config *cfg, const char *root, char **cmd)
         exec_command(cmd);
     }
 
-    pid = fork();
+    pid = fork_process();
     if (pid < 0)
         die_errno("fork PID namespace init");
     if (pid == 0) {
@@ -1435,7 +1551,7 @@ static char *make_temp_root(void)
     template = malloc(len);
     if (!template)
         die_errno("malloc");
-    snprintf(template, len, "%s/microwrap.XXXXXX", base);
+    format_text(template, len, "%s/microwrap.XXXXXX", base);
 
     root = mkdtemp(template);
     if (!root)
@@ -1457,7 +1573,7 @@ int main(int argc, char **argv)
     finalize_config(&cfg);
     root = make_temp_root();
     install_forward_signal_handlers();
-    pid = fork();
+    pid = fork_process();
 
     if (pid < 0)
         die_errno("fork");
@@ -1472,7 +1588,7 @@ int main(int argc, char **argv)
     restore_forward_signal_handlers();
 
     if (rmdir(root) < 0)
-        fprintf(stderr, "microwrap: warning: failed to remove %s: %s\n", root, strerror(errno));
+        warn_remove(root);
 
     free(root);
     free(cfg.home);
