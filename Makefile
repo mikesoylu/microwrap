@@ -14,7 +14,7 @@ RELEASE_LDFLAGS ?= -Wl,-O1,--gc-sections,--strip-all,--build-id=none \
 
 all: microwrap
 
-microwrap: src/microwrap.c
+microwrap: microwrap.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 release:

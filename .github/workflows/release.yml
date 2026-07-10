@@ -80,7 +80,7 @@ jobs:
                 if command -v dnf >/dev/null 2>&1; then
                   dnf install -y diffutils >/dev/null
                 fi
-                exec /work/tests/smoke.sh
+                exec /work/test.sh
               '
           done
 

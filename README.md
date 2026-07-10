@@ -104,7 +104,7 @@ docker run --rm --privileged -v "$PWD:/work" -w /work debian:trixie-slim \
           apt-get install -y --no-install-recommends build-essential &&
           make clean &&
           make CFLAGS="-O2 -Wall -Wextra -Werror -std=c11" &&
-          ./tests/smoke.sh'
+          ./test.sh'
 ```
 
 ## Examples
