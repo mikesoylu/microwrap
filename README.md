@@ -31,24 +31,18 @@ The only build requirement is a Linux C toolchain and libc headers.
 
 ## Releases
 
-Pushing a tag such as `v0.1.0` builds and publishes static Linux release
-archives for EC2 `amd64` instances and ARM64/Graviton instances. The binaries
-are tested on Debian and Amazon Linux 2023 and do not depend on the target
-system's libc.
+Every push to `main` builds and publishes a release named after the first 12
+characters of the commit SHA, such as `sha-dc50e4d12345`. The release points to
+the full commit SHA; its Linux archives target EC2 `amd64` instances and
+ARM64/Graviton instances. The binaries are tested on Debian and Amazon Linux
+2023 and do not depend on the target system's libc.
 
 Release assets are named:
 
 ```text
-microwrap-VERSION-linux-amd64.tar.gz
-microwrap-VERSION-linux-arm64.tar.gz
+microwrap-sha-COMMIT-linux-amd64.tar.gz
+microwrap-sha-COMMIT-linux-arm64.tar.gz
 SHA256SUMS
-```
-
-For example, create a release with:
-
-```sh
-git tag v0.1.0
-git push origin v0.1.0
 ```
 
 ## Usage
