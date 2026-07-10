@@ -1,57 +1,21 @@
 # microwrap
 
-`microwrap` is a tiny Linux-only filesystem wrapper inspired by the small,
-useful part of `bubblewrap`: create a private mount namespace, build a minimal
-root filesystem, map folders, then run a command. It provides practical shell
-defaults while keeping every filesystem mapping explicit or replaceable.
+`microwrap` is a tiny (~25 KiB gzipped) `bubblewrap` alternative. It implements the
+essential parts of `bubblewrap`: create private namespaces, build a minimal
+filesystem, map folders, then run a command.
 
 It is intentionally not a full sandbox. There is no seccomp, cgroups, device
 policy, network setup, or desktop/session integration.
 
-## Build
-
-```sh
-make
-```
-
-For a size-optimized, stripped binary:
-
-```sh
-make release
-```
-
-Release builds use 4 KiB ELF page alignment to avoid substantial padding on
-ARM64. For a Linux target with 64 KiB pages, build with:
-
-```sh
-make release RELEASE_MAX_PAGE_SIZE=65536
-```
-
-The only build requirement is a Linux C toolchain and libc headers.
-
 ## Install
 
-Install the latest tested release to `/usr/local/bin`:
+Install the latest tested release to `/usr/local/bin` as root:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mikesoylu/microwrap/main/setup.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/mikesoylu/microwrap/main/setup.sh | sh
 ```
 
-For a user-local installation, make sure `$HOME/.local/bin` is on `PATH` and
-choose that prefix:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/mikesoylu/microwrap/main/setup.sh | \
-  sh -s -- --prefix "$HOME/.local"
-```
-
-The installer detects `amd64` and ARM64/Graviton machines and verifies the
-release checksum before installing. A SHA release can be selected explicitly:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/mikesoylu/microwrap/main/setup.sh | \
-  sudo sh -s -- --release sha-b54344a2d043
-```
+For non-root user-local installation and release selection see [`setup.sh`](setup.sh).
 
 ## Usage
 
@@ -93,9 +57,21 @@ operation at one of those destinations replaces that default. After setup it
 chroots, drops capabilities, sets `no_new_privs`, then forks and execs the
 command.
 
+## Build
+
+```sh
+make
+```
+
+For a size-optimized, stripped binary:
+
+```sh
+make release
+```
+
 ## Test
 
-The smoke tests need a Linux kernel with namespace and mount support. From a
+The tests need a Linux kernel with namespace and mount support. From a
 non-Linux development machine, Docker works:
 
 ```sh
@@ -109,17 +85,19 @@ docker run --rm --privileged -v "$PWD:/work" -w /work debian:trixie-slim \
 
 ## Examples
 
+These examples assume `microwrap` is installed on `PATH`.
+
 Open a shell as the default cosmetic `admin` user with a temporary home:
 
 ```sh
-./microwrap -- /bin/sh
+microwrap -- /bin/sh
 ```
 
 Use a different account name and replace its temporary home with a writable
 host directory:
 
 ```sh
-./microwrap \
+microwrap \
   --user joe \
   --bind /mnt/joeshome /home/joe \
   -- /bin/sh
@@ -128,7 +106,7 @@ host directory:
 Use the original empty-root behavior and specify every mapping yourself:
 
 ```sh
-./microwrap \
+microwrap \
   --no-defaults \
   --ro-bind /usr /usr \
   --ro-bind /bin /bin \
@@ -144,7 +122,7 @@ If you are running with real `CAP_SYS_ADMIN`, you can skip the user namespace
 while retaining the default mount and PID isolation:
 
 ```sh
-./microwrap \
+microwrap \
   --no-userns \
   -- /bin/sh -c 'ls /proc/self'
 ```
