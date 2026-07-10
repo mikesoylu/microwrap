@@ -15,6 +15,8 @@ fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT HUP TERM
+caller_uid=$(id -u)
+caller_gid=$(id -g)
 
 base_args='--ro-bind /bin /bin --ro-bind /usr /usr --ro-bind /lib /lib'
 if [ -e /lib64 ]; then
@@ -22,10 +24,14 @@ if [ -e /lib64 ]; then
 fi
 
 echo "default admin environment"
-"$WRAP" -- /bin/sh -c '
+EXPECTED_UID=$caller_uid EXPECTED_GID=$caller_gid "$WRAP" -- /bin/sh -c '
     set -eu
-    test "$(id -u)" = 0
+    test "$(id -u)" = "$EXPECTED_UID"
+    test "$(id -g)" = "$EXPECTED_GID"
     test "$(id -un)" = admin
+    test "$(id -gn)" = admin
+    test "$(getent passwd admin | cut -d: -f3)" = "$EXPECTED_UID"
+    test "$(getent group admin | cut -d: -f3)" = "$EXPECTED_GID"
     test "$USER" = admin
     test "$LOGNAME" = admin
     test "$HOME" = /home/admin
@@ -38,6 +44,13 @@ echo "default admin environment"
     test -d "$XDG_CONFIG_HOME"
     touch "$HOME/home-write" "$TMPDIR/tmp-write"
 '
+if [ -x /bin/bash ]; then
+    EXPECTED_UID=$caller_uid EXPECTED_GID=$caller_gid "$WRAP" -- /bin/bash -c '
+        test "$UID" = "$EXPECTED_UID"
+        test "$EUID" = "$EXPECTED_UID"
+        test "$(id -g)" = "$EXPECTED_GID"
+    '
+fi
 
 echo "default runtime configuration"
 host_resolv=$(cksum < /etc/resolv.conf)
@@ -68,9 +81,14 @@ MICROWRAP_LEAK=yes "$WRAP" \
     --bind "$tmp/joe-home" /home/joe \
     --clearenv \
     --setenv PROJECT demo \
+    --setenv EXPECTED_UID "$caller_uid" \
+    --setenv EXPECTED_GID "$caller_gid" \
     -- /bin/sh -c '
         set -eu
+        test "$(id -u)" = "$EXPECTED_UID"
+        test "$(id -g)" = "$EXPECTED_GID"
         test "$(id -un)" = joe
+        test "$(id -gn)" = joe
         test "$USER" = joe
         test "$HOME" = /home/joe
         test "$PWD" = /home/joe

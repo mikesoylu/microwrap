@@ -58,6 +58,8 @@ struct config {
     size_t env_len;
     size_t env_cap;
     const char *user;
+    uid_t uid;
+    gid_t gid;
     char *home;
     const char *workdir;
     bool no_userns;
@@ -572,28 +574,25 @@ static void write_map(const char *path, unsigned long inside_id, unsigned long o
     write_file(path, buf, false);
 }
 
-static void setup_user_namespace(void)
+static void setup_user_namespace(uid_t uid, gid_t gid)
 {
-    uid_t uid = getuid();
-    gid_t gid = getgid();
-
     if (unshare(CLONE_NEWUSER) < 0)
         die_errno("unshare(CLONE_NEWUSER)");
 
     write_file("/proc/self/setgroups", "deny\n", true);
-    write_map("/proc/self/uid_map", 0, (unsigned long)uid);
-    write_map("/proc/self/gid_map", 0, (unsigned long)gid);
+    write_map("/proc/self/uid_map", (unsigned long)uid, (unsigned long)uid);
+    write_map("/proc/self/gid_map", (unsigned long)gid, (unsigned long)gid);
 
-    if (setresgid(0, 0, 0) < 0)
+    if (setresgid(gid, gid, gid) < 0)
         die_errno("setresgid");
-    if (setresuid(0, 0, 0) < 0)
+    if (setresuid(uid, uid, uid) < 0)
         die_errno("setresuid");
 }
 
 static void setup_namespaces(const struct config *cfg)
 {
     if (!cfg->no_userns)
-        setup_user_namespace();
+        setup_user_namespace(cfg->uid, cfg->gid);
 
     if (unshare(CLONE_NEWNS) < 0)
         die_errno("unshare(CLONE_NEWNS)");
@@ -876,9 +875,11 @@ static void setup_account_files(const struct config *cfg, const char *root)
 
     if (!passwd || !group)
         die_errno("malloc");
-    snprintf(passwd, passwd_len, "%s:x:0:0:Microwrap User:%s:/bin/sh\n",
-             cfg->user, cfg->home);
-    snprintf(group, group_len, "%s:x:0:\n", cfg->user);
+    snprintf(passwd, passwd_len, "%s:x:%lu:%lu:Microwrap User:%s:/bin/sh\n",
+             cfg->user, (unsigned long)cfg->uid, (unsigned long)cfg->gid,
+             cfg->home);
+    snprintf(group, group_len, "%s:x:%lu:\n", cfg->user,
+             (unsigned long)cfg->gid);
 
     if (!target_is_overridden(cfg, "/etc/passwd")) {
         target = join_under_root(root, "/etc/passwd");
@@ -1089,11 +1090,14 @@ static char *make_temp_root(void)
 int main(int argc, char **argv)
 {
     struct config cfg = { .user = "admin" };
-    char **cmd = parse_args(argc, argv, &cfg);
+    char **cmd;
     char *root;
     pid_t pid;
     int status;
 
+    cfg.uid = getuid();
+    cfg.gid = getgid();
+    cmd = parse_args(argc, argv, &cfg);
     finalize_config(&cfg);
     root = make_temp_root();
     pid = fork();

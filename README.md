@@ -54,14 +54,15 @@ Runtime options:
   --help               Show usage.
 ```
 
-By default, `microwrap` creates a user namespace, maps your host user to UID 0
-inside it, creates a private mount namespace, and mounts a fresh tmpfs as the
-new root. It maps the host's `/usr` and loader paths read-only, maps a few basic
-devices, creates fresh tmpfs mounts at `/tmp` and `/home/admin`, writes minimal
-passwd/group data, maps common DNS, certificate, loader, and timezone
-configuration from `/etc`, and sets a login-like environment. An explicit
-operation at one of those destinations replaces that default. After setup it
-chroots, drops capabilities, sets `no_new_privs`, and execs the command.
+By default, `microwrap` creates a user namespace and maps the caller's numeric
+UID and primary GID to the same IDs inside it. It then creates a private mount
+namespace and mounts a fresh tmpfs as the new root. It maps the host's `/usr`
+and loader paths read-only, maps a few basic devices, creates fresh tmpfs mounts
+at `/tmp` and `/home/admin`, writes minimal passwd/group data, maps common DNS,
+certificate, loader, and timezone configuration from `/etc`, and sets a
+login-like environment. An explicit operation at one of those destinations
+replaces that default. After setup it chroots, drops capabilities, sets
+`no_new_privs`, and execs the command.
 
 ## Test
 
@@ -128,8 +129,9 @@ and mount a fresh procfs:
   and does not use the newer recursive mount-attribute API.
 - Rootless mode requires unprivileged user namespaces to be enabled by the
   kernel and distribution policy.
-- `--user` is cosmetic. The process remains UID/GID 0 inside the user namespace;
-  the name, home, account files, working directory, and environment change.
+- `--user` is cosmetic. The process keeps the caller's numeric UID and primary
+  GID; the name, home, account files, working directory, and environment change.
+- Supplementary host groups are not mapped into the user namespace.
 - `--proc` may require `--no-userns` because Linux does not generally allow a
   fresh procfs mount from a new user namespace without also creating a suitable
   PID namespace. For a filesystem-only wrapper, use `--bind /proc /proc` if you
