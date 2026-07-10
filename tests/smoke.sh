@@ -39,6 +39,28 @@ echo "default admin environment"
     touch "$HOME/home-write" "$TMPDIR/tmp-write"
 '
 
+echo "default runtime configuration"
+host_resolv=$(cksum < /etc/resolv.conf)
+wrapped_resolv=$("$WRAP" -- /bin/sh -c 'cksum < /etc/resolv.conf')
+test "$wrapped_resolv" = "$host_resolv"
+"$WRAP" -- /bin/sh -c '
+    test -s /etc/hosts
+    getent hosts localhost >/dev/null
+'
+if [ -d /etc/ssl ]; then
+    "$WRAP" -- /bin/sh -c 'test -d /etc/ssl'
+fi
+if [ -r /etc/ld.so.cache ]; then
+    "$WRAP" -- /bin/sh -c 'test -r /etc/ld.so.cache'
+fi
+if [ -r /etc/ssl/certs/ca-certificates.crt ]; then
+    "$WRAP" -- /bin/sh -c 'test -r /etc/ssl/certs/ca-certificates.crt'
+fi
+printf 'nameserver 192.0.2.1\n' > "$tmp/resolv.conf"
+"$WRAP" --ro-bind "$tmp/resolv.conf" /etc/resolv.conf -- /bin/sh -c '
+    test "$(cat /etc/resolv.conf)" = "nameserver 192.0.2.1"
+'
+
 echo "custom user and bound home"
 mkdir -p "$tmp/joe-home"
 MICROWRAP_LEAK=yes "$WRAP" \

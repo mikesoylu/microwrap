@@ -815,6 +815,34 @@ static void mirror_host_path(const struct config *cfg, const char *root,
     free(target);
 }
 
+static void mirror_resolved_path(const struct config *cfg, const char *root,
+                                 const char *path)
+{
+    struct stat st;
+    char *resolved;
+    char *target;
+
+    if (target_is_overridden(cfg, path))
+        return;
+    if (lstat(path, &st) < 0) {
+        if (errno == ENOENT)
+            return;
+        die_errno(path);
+    }
+
+    mirror_host_path(cfg, root, path);
+    if (!S_ISLNK(st.st_mode))
+        return;
+
+    resolved = realpath(path, NULL);
+    if (!resolved)
+        return;
+    target = join_under_root(root, resolved);
+    mount_bind(path, target, true);
+    free(target);
+    free(resolved);
+}
+
 static void default_bind_path(const struct config *cfg, const char *root,
                               const char *path)
 {
@@ -880,6 +908,26 @@ static void setup_default_filesystem(const struct config *cfg, const char *root)
     static const char *device_paths[] = {
         "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty",
     };
+    static const char *etc_paths[] = {
+        "/etc/hosts",
+        "/etc/hostname",
+        "/etc/host.conf",
+        "/etc/gai.conf",
+        "/etc/networks",
+        "/etc/protocols",
+        "/etc/services",
+        "/etc/ssl",
+        "/etc/pki",
+        "/etc/ca-certificates",
+        "/etc/ca-certificates.conf",
+        "/etc/alternatives",
+        "/etc/ld.so.cache",
+        "/etc/ld.so.conf",
+        "/etc/ld.so.conf.d",
+        "/etc/localtime",
+        "/etc/timezone",
+        "/etc/os-release",
+    };
     static const char *home_dirs[] = {
         "/.cache", "/.config", "/.local/share", "/.local/state",
     };
@@ -889,6 +937,9 @@ static void setup_default_filesystem(const struct config *cfg, const char *root)
         mirror_host_path(cfg, root, system_paths[i]);
     for (size_t i = 0; i < sizeof(device_paths) / sizeof(device_paths[0]); i++)
         default_bind_path(cfg, root, device_paths[i]);
+    mirror_resolved_path(cfg, root, "/etc/resolv.conf");
+    for (size_t i = 0; i < sizeof(etc_paths) / sizeof(etc_paths[0]); i++)
+        mirror_host_path(cfg, root, etc_paths[i]);
 
     if (!target_is_overridden(cfg, "/tmp")) {
         target = join_under_root(root, "/tmp");

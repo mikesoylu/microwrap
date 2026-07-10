@@ -58,9 +58,10 @@ By default, `microwrap` creates a user namespace, maps your host user to UID 0
 inside it, creates a private mount namespace, and mounts a fresh tmpfs as the
 new root. It maps the host's `/usr` and loader paths read-only, maps a few basic
 devices, creates fresh tmpfs mounts at `/tmp` and `/home/admin`, writes minimal
-passwd/group data, and sets a login-like environment. An explicit operation at
-one of those destinations replaces that default. After setup it chroots, drops
-capabilities, sets `no_new_privs`, and execs the command.
+passwd/group data, maps common DNS, certificate, loader, and timezone
+configuration from `/etc`, and sets a login-like environment. An explicit
+operation at one of those destinations replaces that default. After setup it
+chroots, drops capabilities, sets `no_new_privs`, and execs the command.
 
 ## Test
 
@@ -133,6 +134,8 @@ and mount a fresh procfs:
   fresh procfs mount from a new user namespace without also creating a suitable
   PID namespace. For a filesystem-only wrapper, use `--bind /proc /proc` if you
   explicitly want the host proc view.
-- DNS configuration, certificates, and other `/etc` data are not mapped by
-  default. Map them explicitly when a command needs them.
+- Common runtime configuration is mapped read-only from `/etc`, including DNS,
+  hosts, NSS network databases, certificates, loader configuration, and
+  timezone data. Unrelated files such as host keys and credentials remain
+  hidden unless explicitly mapped.
 - The process still shares the host PID, IPC, UTS, and network namespaces.
