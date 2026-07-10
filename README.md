@@ -5,7 +5,8 @@ essential parts of `bubblewrap`: create private namespaces, build a minimal
 filesystem, map folders, then run a command.
 
 It is intentionally not a full sandbox. There is no seccomp, cgroups, device
-policy, network setup, or desktop/session integration.
+policy, or desktop/session integration. Optional network modes provide clean
+per-wrapper port and interface namespaces rather than a security boundary.
 
 ## Install
 
@@ -40,6 +41,7 @@ Runtime options:
   --no-defaults        Disable automatic mounts, account files, and env.
   --no-userns          Do not create a user namespace. Requires CAP_SYS_ADMIN.
   --share-pid          Share the caller's PID namespace and procfs.
+  --network MODE       Network mode: host, none, or internet. Defaults to host.
   --help               Print the online usage URL.
 ```
 
@@ -77,7 +79,7 @@ non-Linux development machine, Docker works:
 ```sh
 docker run --rm --privileged -v "$PWD:/work" -w /work debian:trixie-slim \
   sh -lc 'apt-get update &&
-          apt-get install -y --no-install-recommends build-essential &&
+          apt-get install -y --no-install-recommends build-essential slirp4netns &&
           make clean &&
           make CFLAGS="-O2 -Wall -Wextra -Werror -std=c11" &&
           ./test.sh'
@@ -127,6 +129,19 @@ microwrap \
   -- /bin/sh -c 'ls /proc/self'
 ```
 
+Give a process its own interfaces and port space with no external network:
+
+```sh
+microwrap --network none -- /bin/sh
+```
+
+Give it an isolated port space with outbound IPv4 Internet access. This mode
+requires `slirp4netns` on the host:
+
+```sh
+microwrap --network internet -- curl https://example.com
+```
+
 ## Notes
 
 - `--bind` and `--ro-bind` are non-recursive. Submounts under `SRC` are not
@@ -135,6 +150,18 @@ microwrap \
   and does not use the newer recursive mount-attribute API.
 - Rootless mode requires unprivileged user namespaces to be enabled by the
   kernel and distribution policy.
+- `--network host` preserves the caller's network namespace and is the default.
+  `--network none` creates a private namespace with no externally connected
+  interface and brings up its private loopback device.
+  `--network internet` adds a private TAP interface and outbound IPv4 access
+  through `slirp4netns`; it fails with a diagnostic when the helper is absent.
+- Private, link-local, shared, documentation, benchmarking, multicast, and
+  reserved IPv4 destinations are unreachable in `internet` mode. Sandbox-local
+  loopback remains usable. The policy is intended for predictable environments,
+  not as a hardened firewall against a hostile process.
+- Listening sockets in `none` and `internet` modes do not occupy or publish host
+  ports. Internet connections necessarily use transient host-side client sockets
+  in `slirp4netns`. There is no automatic inbound port forwarding.
 - `--user` is cosmetic. The process keeps the caller's numeric UID and primary
   GID; the name, home, account files, working directory, and environment change.
 - Supplementary host groups are not mapped into the user namespace.
@@ -158,4 +185,5 @@ microwrap \
   when the wrapped command exits; `/usr` and mapped runtime configuration remain
   read-only. Setuid execution cannot elevate privileges because `no_new_privs`
   is set before exec.
-- The process still shares the host IPC, UTS, and network namespaces.
+- The process still shares the host IPC and UTS namespaces. It shares the host
+  network namespace only in the default `host` network mode.

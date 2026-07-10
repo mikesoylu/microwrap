@@ -6,6 +6,10 @@ on:
       - main
     paths:
       - microwrap.c
+      - test-network.c
+      - test.sh
+      - Makefile
+      - .github/workflows/release.yml
 
 permissions:
   contents: write
@@ -79,8 +83,14 @@ jobs:
               --env "WRAP=${wrap}" \
               "${image}" \
               /bin/sh -euc '
-                if command -v dnf >/dev/null 2>&1; then
-                  dnf install -y diffutils >/dev/null
+                if command -v apt-get >/dev/null 2>&1; then
+                  apt-get update -qq
+                  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                    --no-install-recommends gcc libc6-dev slirp4netns >/dev/null
+                elif command -v dnf >/dev/null 2>&1; then
+                  dnf install -y diffutils gcc glibc-devel >/dev/null
+                  dnf install -y slirp4netns >/dev/null || \
+                    echo "slirp4netns unavailable; Internet tests will skip" >&2
                 fi
                 exec /work/test.sh
               '
