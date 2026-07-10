@@ -2,6 +2,7 @@
 set -eu
 
 WRAP=${WRAP:-./microwrap}
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 case "$(uname -s)" in
 Linux) ;;
@@ -16,15 +17,20 @@ fi
 tmp=$(mktemp -d)
 outside_pid=
 wrapper_pid=
+listener_pid=
 cleanup()
 {
     [ -z "$wrapper_pid" ] || kill "$wrapper_pid" 2>/dev/null || true
+    [ -z "$listener_pid" ] || kill "$listener_pid" 2>/dev/null || true
     [ -z "$outside_pid" ] || kill "$outside_pid" 2>/dev/null || true
     rm -rf "$tmp"
 }
 trap cleanup EXIT INT HUP TERM
 caller_uid=$(id -u)
 caller_gid=$(id -g)
+network_test="$tmp/test-network"
+${CC:-cc} ${CFLAGS:--O2 -Wall -Wextra -Werror -std=c11} \
+    -o "$network_test" "$script_dir/test-network.c"
 
 base_args='--ro-bind /bin /bin --ro-bind /usr /usr --ro-bind /lib /lib'
 if [ -e /lib64 ]; then
@@ -40,6 +46,18 @@ if "$WRAP" --unknown >"$tmp/unknown.out" 2>"$tmp/unknown.err"; then
 fi
 test ! -s "$tmp/unknown.out"
 grep -Fx "microwrap: unknown option: --unknown" "$tmp/unknown.err" >/dev/null
+if "$WRAP" --network >"$tmp/network-missing.out" 2>"$tmp/network-missing.err"; then
+    echo "missing network mode unexpectedly succeeded" >&2
+    exit 1
+fi
+grep -Fx "microwrap: --network requires MODE" "$tmp/network-missing.err" >/dev/null
+if "$WRAP" --network local -- /bin/true \
+    >"$tmp/network-invalid.out" 2>"$tmp/network-invalid.err"; then
+    echo "invalid network mode unexpectedly succeeded" >&2
+    exit 1
+fi
+grep -Fx "microwrap: invalid network mode: local" \
+    "$tmp/network-invalid.err" >/dev/null
 
 echo "default admin environment"
 EXPECTED_UID=$caller_uid EXPECTED_GID=$caller_gid "$WRAP" -- /bin/sh -c '
@@ -147,6 +165,165 @@ descendant_pid=$(cat "$tmp/descendant-pid")
 if kill -0 "$descendant_pid" 2>/dev/null; then
     echo "descendant survived namespace init exit" >&2
     exit 1
+fi
+
+echo "network namespaces and isolated ports"
+host_network=$(readlink /proc/self/ns/net)
+wrapped_host_network=$("$WRAP" -- /bin/readlink /proc/self/ns/net)
+test "$wrapped_host_network" = "$host_network"
+isolated_network=$("$WRAP" --network none -- /bin/readlink /proc/self/ns/net)
+test "$isolated_network" != "$host_network"
+"$WRAP" --network none --ro-bind "$network_test" /net-test -- /bin/sh -c '
+    set -eu
+    test -e /sys/class/net/lo
+    test ! -e /sys/class/net/eth0
+    /net-test hold 127.0.0.1 0 /tmp/listener-port &
+    listener=$!
+    i=0
+    while [ ! -s /tmp/listener-port ] && [ "$i" -lt 100 ]; do
+        sleep 0.01
+        i=$((i + 1))
+    done
+    test -s /tmp/listener-port
+    /net-test connect 127.0.0.1 "$(cat /tmp/listener-port)"
+    kill "$listener"
+    wait "$listener" 2>/dev/null || true
+'
+
+rm -f "$tmp/host-listener-port"
+"$network_test" hold 127.0.0.1 0 "$tmp/host-listener-port" &
+listener_pid=$!
+i=0
+while [ ! -s "$tmp/host-listener-port" ] && [ "$i" -lt 100 ]; do
+    sleep 0.01
+    i=$((i + 1))
+done
+test -s "$tmp/host-listener-port"
+host_listener_port=$(cat "$tmp/host-listener-port")
+"$WRAP" --network none --ro-bind "$network_test" /net-test \
+    -- /net-test bind 0.0.0.0 "$host_listener_port"
+kill "$listener_pid"
+wait "$listener_pid" 2>/dev/null || true
+listener_pid=
+
+rm -f "$tmp/isolated-listener-port"
+"$WRAP" --network none \
+    --ro-bind "$network_test" /net-test \
+    --bind "$tmp" /out \
+    -- /net-test hold 0.0.0.0 0 /out/isolated-listener-port &
+wrapper_pid=$!
+i=0
+while [ ! -s "$tmp/isolated-listener-port" ] && [ "$i" -lt 100 ]; do
+    sleep 0.01
+    i=$((i + 1))
+done
+test -s "$tmp/isolated-listener-port"
+if "$network_test" connect 127.0.0.1 \
+    "$(cat "$tmp/isolated-listener-port")"; then
+    echo "isolated listener was reachable from the host" >&2
+    exit 1
+fi
+kill -TERM "$wrapper_pid"
+if wait "$wrapper_pid"; then
+    isolated_status=0
+else
+    isolated_status=$?
+fi
+wrapper_pid=
+test "$isolated_status" = 143
+
+echo "outbound-only Internet networking"
+if PATH=/nonexistent "$WRAP" --network internet -- /bin/true \
+    >"$tmp/missing-slirp.out" 2>"$tmp/missing-slirp.err"; then
+    echo "Internet mode unexpectedly worked without slirp4netns" >&2
+    exit 1
+fi
+test ! -s "$tmp/missing-slirp.out"
+grep -Fx "microwrap: slirp4netns exited before the network was ready" \
+    "$tmp/missing-slirp.err" >/dev/null
+
+if command -v slirp4netns >/dev/null 2>&1; then
+    rm -f "$tmp/host-listener-port"
+    "$network_test" hold 0.0.0.0 0 "$tmp/host-listener-port" &
+    listener_pid=$!
+    i=0
+    while [ ! -s "$tmp/host-listener-port" ] && [ "$i" -lt 100 ]; do
+        sleep 0.01
+        i=$((i + 1))
+    done
+    test -s "$tmp/host-listener-port"
+    host_listener_port=$(cat "$tmp/host-listener-port")
+
+    "$WRAP" --network internet \
+        --ro-bind "$network_test" /net-test \
+        --setenv HOST_LISTENER_PORT "$host_listener_port" \
+        -- /bin/sh -c '
+            set -eu
+            test "$(cat /etc/resolv.conf)" = "nameserver 10.0.2.3"
+            test -e /sys/class/net/tap0
+            /net-test bind 0.0.0.0 "$HOST_LISTENER_PORT"
+            if /net-test connect 10.0.2.2 "$HOST_LISTENER_PORT"; then
+                exit 1
+            fi
+            awk '\''$2 == "0000A8C0" && $4 == "0201" && $8 == "0000FFFF" {
+                     found = 1
+                 }
+                 END { exit !found }'\'' /proc/net/route
+            getent hosts example.com >/dev/null
+            /net-test connect 1.1.1.1 443
+        '
+    kill "$listener_pid"
+    wait "$listener_pid" 2>/dev/null || true
+    listener_pid=
+
+    "$WRAP" --network internet -- /bin/true \
+        >"$tmp/internet-quiet.out" 2>"$tmp/internet-quiet.err"
+    test ! -s "$tmp/internet-quiet.out"
+    test ! -s "$tmp/internet-quiet.err"
+
+    rm -f "$tmp/internet-ready"
+    "$WRAP" --network internet \
+        --ro-bind "$network_test" /net-test \
+        --bind "$tmp" /out -- \
+        /net-test hold 0.0.0.0 0 /out/internet-ready &
+    wrapper_pid=$!
+    i=0
+    while [ ! -s "$tmp/internet-ready" ] && [ "$i" -lt 100 ]; do
+        sleep 0.02
+        i=$((i + 1))
+    done
+    test -s "$tmp/internet-ready"
+    if "$network_test" connect 127.0.0.1 "$(cat "$tmp/internet-ready")"; then
+        echo "Internet-mode listener was reachable from the host" >&2
+        exit 1
+    fi
+    helper_pid=
+    i=0
+    while [ -z "$helper_pid" ] && [ "$i" -lt 100 ]; do
+        for child in $(cat "/proc/$wrapper_pid/task/$wrapper_pid/children"); do
+            if [ "$(cat "/proc/$child/comm" 2>/dev/null || true)" = slirp4netns ]; then
+                helper_pid=$child
+                break
+            fi
+        done
+        [ -n "$helper_pid" ] || sleep 0.02
+        i=$((i + 1))
+    done
+    test -n "$helper_pid"
+    kill -TERM "$wrapper_pid"
+    if wait "$wrapper_pid"; then
+        internet_status=0
+    else
+        internet_status=$?
+    fi
+    wrapper_pid=
+    test "$internet_status" = 143
+    if kill -0 "$helper_pid" 2>/dev/null; then
+        echo "slirp4netns survived microwrap exit" >&2
+        exit 1
+    fi
+else
+    echo "skipping Internet integration tests: slirp4netns not found" >&2
 fi
 
 echo "proc, sys, and standard devices"

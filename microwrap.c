@@ -7,7 +7,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/if.h>
 #include <linux/capability.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -16,8 +19,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -50,6 +55,12 @@ struct env_op {
     const char *value;
 };
 
+enum network_mode {
+    NETWORK_HOST,
+    NETWORK_NONE,
+    NETWORK_INTERNET,
+};
+
 struct config {
     struct op *ops;
     size_t len;
@@ -62,6 +73,7 @@ struct config {
     gid_t gid;
     char *home;
     const char *workdir;
+    enum network_mode network;
     bool no_userns;
     bool share_pid;
     bool clear_env;
@@ -427,6 +439,20 @@ static char **parse_args(int argc, char **argv, struct config *cfg)
             cfg->no_userns = true;
         } else if (strcmp(arg, "--share-pid") == 0) {
             cfg->share_pid = true;
+        } else if (strcmp(arg, "--network") == 0) {
+            const char *mode;
+
+            if (i + 1 >= argc)
+                die("--network requires MODE");
+            mode = argv[++i];
+            if (strcmp(mode, "host") == 0)
+                cfg->network = NETWORK_HOST;
+            else if (strcmp(mode, "none") == 0)
+                cfg->network = NETWORK_NONE;
+            else if (strcmp(mode, "internet") == 0)
+                cfg->network = NETWORK_INTERNET;
+            else
+                die("invalid network mode: %s", mode);
         } else if (strcmp(arg, "--help") == 0) {
             show_docs(STDOUT_FILENO, 0);
         } else {
@@ -713,7 +739,170 @@ static void setup_user_namespace(uid_t uid, gid_t gid)
         die_errno("setresuid");
 }
 
-static void setup_namespaces(const struct config *cfg)
+struct network_sync {
+    int ready_fd;
+    int gate_fd;
+};
+
+struct blocked_route {
+    int family;
+    unsigned char prefix_len;
+    unsigned char address[16];
+};
+
+static void bring_up_loopback(void)
+{
+    struct ifreq request;
+    int fd;
+
+    fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        die_errno("socket for loopback setup");
+    memset(&request, 0, sizeof(request));
+    memcpy(request.ifr_name, "lo", sizeof("lo"));
+    if (ioctl(fd, SIOCGIFFLAGS, &request) < 0)
+        die_errno("get loopback flags");
+    request.ifr_flags |= IFF_UP;
+    if (ioctl(fd, SIOCSIFFLAGS, &request) < 0)
+        die_errno("bring up loopback");
+    if (close(fd) < 0)
+        die_errno("close loopback socket");
+}
+
+static void add_unreachable_route(int fd, unsigned int sequence,
+                                  const struct blocked_route *route)
+{
+    struct {
+        struct nlmsghdr header;
+        struct rtmsg route;
+        unsigned char attributes[RTA_SPACE(16)];
+    } request;
+    struct sockaddr_nl kernel;
+    struct rtattr *destination;
+    size_t address_len = route->family == AF_INET ? 4 : 16;
+    char response[4096];
+
+    memset(&request, 0, sizeof(request));
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(request.route));
+    request.header.nlmsg_type = RTM_NEWROUTE;
+    request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK |
+                                 NLM_F_CREATE | NLM_F_EXCL;
+    request.header.nlmsg_seq = sequence;
+    request.route.rtm_family = (unsigned char)route->family;
+    request.route.rtm_dst_len = route->prefix_len;
+    request.route.rtm_table = RT_TABLE_MAIN;
+    request.route.rtm_protocol = RTPROT_STATIC;
+    request.route.rtm_scope = RT_SCOPE_UNIVERSE;
+    request.route.rtm_type = RTN_UNREACHABLE;
+
+    destination = (struct rtattr *)((char *)&request +
+                                    NLMSG_ALIGN(request.header.nlmsg_len));
+    destination->rta_type = RTA_DST;
+    destination->rta_len = RTA_LENGTH(address_len);
+    memcpy(RTA_DATA(destination), route->address, address_len);
+    request.header.nlmsg_len = NLMSG_ALIGN(request.header.nlmsg_len) +
+                               RTA_LENGTH(address_len);
+
+    memset(&kernel, 0, sizeof(kernel));
+    kernel.nl_family = AF_NETLINK;
+    if (sendto(fd, &request, request.header.nlmsg_len, 0,
+               (struct sockaddr *)&kernel, sizeof(kernel)) < 0)
+        die_errno("add isolated-network route");
+
+    for (;;) {
+        struct nlmsghdr *header;
+        ssize_t len = recv(fd, response, sizeof(response), 0);
+
+        if (len < 0) {
+            if (errno == EINTR)
+                continue;
+            die_errno("acknowledge isolated-network route");
+        }
+        for (header = (struct nlmsghdr *)response;
+             NLMSG_OK(header, (unsigned int)len);
+             header = NLMSG_NEXT(header, len)) {
+            struct nlmsgerr *error;
+
+            if (header->nlmsg_seq != sequence ||
+                header->nlmsg_type != NLMSG_ERROR)
+                continue;
+            error = NLMSG_DATA(header);
+            if (error->error != 0) {
+                errno = -error->error;
+                die_errno("add isolated-network route");
+            }
+            return;
+        }
+    }
+}
+
+static void setup_internet_routes(void)
+{
+    static const struct blocked_route routes[] = {
+        { AF_INET, 8,  { 0 } },
+        { AF_INET, 8,  { 10 } },
+        { AF_INET, 10, { 100, 64 } },
+        { AF_INET, 16, { 169, 254 } },
+        { AF_INET, 12, { 172, 16 } },
+        { AF_INET, 24, { 192, 0, 0 } },
+        { AF_INET, 24, { 192, 0, 2 } },
+        { AF_INET, 24, { 192, 88, 99 } },
+        { AF_INET, 16, { 192, 168 } },
+        { AF_INET, 15, { 198, 18 } },
+        { AF_INET, 24, { 198, 51, 100 } },
+        { AF_INET, 24, { 203, 0, 113 } },
+        { AF_INET, 4,  { 224 } },
+        { AF_INET, 4,  { 240 } },
+    };
+    struct sockaddr_nl local;
+    int fd;
+
+    fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (fd < 0)
+        die_errno("open route socket");
+    memset(&local, 0, sizeof(local));
+    local.nl_family = AF_NETLINK;
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0)
+        die_errno("bind route socket");
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++)
+        add_unreachable_route(fd, (unsigned int)i + 1, &routes[i]);
+    if (close(fd) < 0)
+        die_errno("close route socket");
+}
+
+static void signal_network_namespace_ready(const struct network_sync *sync)
+{
+    char byte = '1';
+
+    for (;;) {
+        ssize_t written = write(sync->ready_fd, &byte, 1);
+
+        if (written == 1)
+            break;
+        if (written < 0 && errno == EINTR)
+            continue;
+        die_errno("signal network namespace readiness");
+    }
+    if (close(sync->ready_fd) < 0)
+        die_errno("close network readiness pipe");
+
+    for (;;) {
+        char ignored[16];
+        ssize_t len = read(sync->gate_fd, ignored, sizeof(ignored));
+
+        if (len == 0)
+            break;
+        if (len < 0 && errno == EINTR)
+            continue;
+        if (len < 0)
+            die_errno("wait for Internet helper");
+    }
+    if (close(sync->gate_fd) < 0)
+        die_errno("close network gate pipe");
+}
+
+static void setup_namespaces(const struct config *cfg,
+                             const struct network_sync *network_sync)
 {
     if (!cfg->no_userns)
         setup_user_namespace(cfg->uid, cfg->gid);
@@ -726,6 +915,15 @@ static void setup_namespaces(const struct config *cfg)
 
     if (!cfg->share_pid && unshare(CLONE_NEWPID) < 0)
         die_errno("unshare(CLONE_NEWPID)");
+
+    if (cfg->network != NETWORK_HOST && unshare(CLONE_NEWNET) < 0)
+        die_errno("unshare(CLONE_NEWNET)");
+    if (cfg->network == NETWORK_NONE)
+        bring_up_loopback();
+    if (cfg->network == NETWORK_INTERNET) {
+        signal_network_namespace_ready(network_sync);
+        setup_internet_routes();
+    }
 }
 
 static void drop_caps(void)
@@ -771,13 +969,13 @@ static void ensure_stdio(void)
     }
 }
 
-static void close_extra_fds(void)
+static void close_fds_from(unsigned int first)
 {
     struct rlimit limit;
     rlim_t max_fd;
 
 #ifdef SYS_close_range
-    if (syscall(SYS_close_range, 3U, ~0U, 0U) == 0)
+    if (syscall(SYS_close_range, first, ~0U, 0U) == 0)
         return;
 #endif
 
@@ -787,8 +985,13 @@ static void close_extra_fds(void)
         max_fd = limit.rlim_cur;
     if (max_fd > 1024 * 1024)
         max_fd = 1024 * 1024;
-    for (rlim_t fd = 3; fd < max_fd; fd++)
+    for (rlim_t fd = first; fd < max_fd; fd++)
         close((int)fd);
+}
+
+static void close_extra_fds(void)
+{
+    close_fds_from(3);
 }
 
 static void apply_op(const char *root, const struct op *op)
@@ -1137,6 +1340,52 @@ static void setup_default_procfs(const struct config *cfg, const char *root)
         make_default_path_readonly(cfg, root, readonly_paths[i]);
 }
 
+static void setup_network_sysfs(const struct config *cfg, const char *root)
+{
+    static const char *network_paths[] = {
+        "/sys/class/net",
+        "/sys/devices/virtual/net",
+    };
+    char *scratch;
+    bool needed = false;
+
+    if (cfg->network == NETWORK_HOST)
+        return;
+    for (size_t i = 0;
+         i < sizeof(network_paths) / sizeof(network_paths[0]); i++) {
+        if (!target_is_overridden(cfg, network_paths[i]))
+            needed = true;
+    }
+    if (!needed)
+        return;
+
+    scratch = join_under_root(root, "/.microwrap-sysfs");
+    mkdir_p(scratch, 0755);
+    if (mount("sysfs", scratch, "sysfs",
+              MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0)
+        die_errno("private sysfs mount");
+
+    for (size_t i = 0;
+         i < sizeof(network_paths) / sizeof(network_paths[0]); i++) {
+        char *source;
+        char *target;
+
+        if (target_is_overridden(cfg, network_paths[i]))
+            continue;
+        source = append_path(scratch, network_paths[i] + strlen("/sys"));
+        target = join_under_root(root, network_paths[i]);
+        mount_bind(source, target, true);
+        free(target);
+        free(source);
+    }
+
+    if (umount2(scratch, 0) < 0)
+        die_errno("unmount private sysfs staging mount");
+    if (rmdir(scratch) < 0)
+        die_errno("remove private sysfs staging directory");
+    free(scratch);
+}
+
 static void setup_account_files(const struct config *cfg, const char *root)
 {
     static const char nsswitch[] =
@@ -1224,6 +1473,7 @@ static void setup_default_filesystem(const struct config *cfg, const char *root)
         setup_default_procfs(cfg, root);
     for (size_t i = 0; i < sizeof(sys_paths) / sizeof(sys_paths[0]); i++)
         default_bind_path(cfg, root, sys_paths[i]);
+    setup_network_sysfs(cfg, root);
     for (size_t i = 0; i < sizeof(device_paths) / sizeof(device_paths[0]); i++)
         default_bind_path(cfg, root, device_paths[i]);
 
@@ -1280,7 +1530,15 @@ static void setup_default_filesystem(const struct config *cfg, const char *root)
         }
     }
 
-    mirror_resolved_path(cfg, root, "/etc/resolv.conf");
+    if (cfg->network == NETWORK_INTERNET &&
+        !target_is_overridden(cfg, "/etc/resolv.conf")) {
+        target = join_under_root(root, "/etc/resolv.conf");
+        write_regular_file(target,
+                           "nameserver 10.0.2.3\n");
+        free(target);
+    } else {
+        mirror_resolved_path(cfg, root, "/etc/resolv.conf");
+    }
     for (size_t i = 0; i < sizeof(etc_paths) / sizeof(etc_paths[0]); i++)
         mirror_host_path(cfg, root, etc_paths[i]);
 
@@ -1516,11 +1774,12 @@ static int pid_namespace_main(const struct config *cfg, const char *root,
     return supervise_process(pid, true);
 }
 
-static int child_main(const struct config *cfg, const char *root, char **cmd)
+static int child_main(const struct config *cfg, const char *root, char **cmd,
+                      const struct network_sync *network_sync)
 {
     pid_t pid;
 
-    setup_namespaces(cfg);
+    setup_namespaces(cfg, network_sync);
     if (cfg->share_pid) {
         setup_sandbox(cfg, root);
         exec_command(cmd);
@@ -1559,9 +1818,187 @@ static char *make_temp_root(void)
     return template;
 }
 
+struct network_helper {
+    pid_t pid;
+    int exit_fd;
+};
+
+static void make_cloexec_pipe(int fds[2])
+{
+    if (pipe2(fds, O_CLOEXEC) < 0)
+        die_errno("pipe2");
+}
+
+static bool read_readiness_byte(int fd, pid_t sandbox)
+{
+    char byte;
+
+    for (;;) {
+        ssize_t len = read(fd, &byte, 1);
+
+        if (len == 1)
+            return true;
+        if (len == 0)
+            return false;
+        if (errno == EINTR) {
+            forward_pending_signal(sandbox);
+            continue;
+        }
+        die_errno("read network readiness pipe");
+    }
+}
+
+static int wait_for_process(pid_t pid)
+{
+    int status;
+
+    for (;;) {
+        pid_t waited = waitpid(pid, &status, 0);
+
+        if (waited == pid)
+            return wait_status_code(status);
+        if (waited < 0 && errno == EINTR)
+            continue;
+        die_errno("waitpid");
+    }
+}
+
+static void prepare_helper_fds(int ready_fd, int exit_fd)
+{
+    int saved_ready;
+    int saved_exit;
+
+    saved_ready = fcntl(ready_fd, F_DUPFD_CLOEXEC, 5);
+    if (saved_ready < 0)
+        die_errno("duplicate slirp4netns ready fd");
+    saved_exit = fcntl(exit_fd, F_DUPFD_CLOEXEC, 5);
+    if (saved_exit < 0)
+        die_errno("duplicate slirp4netns exit fd");
+    if (dup2(saved_ready, 3) < 0)
+        die_errno("install slirp4netns ready fd");
+    if (dup2(saved_exit, 4) < 0)
+        die_errno("install slirp4netns exit fd");
+    close_fds_from(5);
+}
+
+static void silence_network_helper(void)
+{
+    int fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+
+    if (fd < 0)
+        die_errno("open /dev/null for slirp4netns");
+    if (dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0)
+        die_errno("redirect slirp4netns output");
+    close(fd);
+}
+
+static bool launch_network_helper(pid_t sandbox, struct network_helper *helper)
+{
+    int ready_pipe[2];
+    int exit_pipe[2];
+    pid_t pid;
+
+    make_cloexec_pipe(ready_pipe);
+    make_cloexec_pipe(exit_pipe);
+    pid = fork_process();
+    if (pid < 0)
+        die_errno("fork slirp4netns");
+    if (pid == 0) {
+        char target[64];
+        char *args[] = {
+            (char *)"slirp4netns",
+            (char *)"--configure",
+            (char *)"--disable-host-loopback",
+            (char *)"--ready-fd=3",
+            (char *)"--exit-fd=4",
+            target,
+            (char *)"tap0",
+            NULL,
+        };
+
+        prepare_helper_fds(ready_pipe[1], exit_pipe[0]);
+        restore_forward_signal_handlers();
+        restore_signal_mask();
+        format_text(target, sizeof(target), "%lu", (unsigned long)sandbox);
+        silence_network_helper();
+        execvp(args[0], args);
+        die_errno("slirp4netns");
+    }
+
+    close(ready_pipe[1]);
+    close(exit_pipe[0]);
+    helper->pid = pid;
+    helper->exit_fd = exit_pipe[1];
+    if (!read_readiness_byte(ready_pipe[0], sandbox)) {
+        close(ready_pipe[0]);
+        close(helper->exit_fd);
+        wait_for_process(pid);
+        helper->pid = -1;
+        helper->exit_fd = -1;
+        write_output(STDERR_FILENO,
+                     "microwrap: slirp4netns exited before the network was ready\n");
+        return false;
+    }
+    close(ready_pipe[0]);
+    return true;
+}
+
+static void kill_blocked_sandbox(pid_t sandbox)
+{
+    if (kill(sandbox, SIGKILL) < 0 && errno != ESRCH)
+        die_errno("kill sandbox after network setup failure");
+    wait_for_process(sandbox);
+}
+
+static int supervise_networked_process(pid_t sandbox,
+                                       struct network_helper *helper)
+{
+    int status;
+
+    for (;;) {
+        pid_t waited;
+
+        forward_pending_signal(sandbox);
+        waited = waitpid(-1, &status, 0);
+        if (waited < 0) {
+            if (errno == EINTR)
+                continue;
+            die_errno("waitpid");
+        }
+        if (waited == sandbox) {
+            int result = wait_status_code(status);
+
+            close(helper->exit_fd);
+            wait_for_process(helper->pid);
+            return result;
+        }
+        if (waited == helper->pid) {
+            pid_t child_waited;
+
+            close(helper->exit_fd);
+            child_waited = waitpid(sandbox, &status, WNOHANG);
+            if (child_waited == sandbox)
+                return wait_status_code(status);
+            if (child_waited < 0 && errno != EINTR)
+                die_errno("waitpid");
+
+            write_output(STDERR_FILENO,
+                         "microwrap: slirp4netns exited unexpectedly\n");
+            if (kill(sandbox, SIGTERM) < 0 && errno != ESRCH)
+                die_errno("terminate sandbox after slirp4netns exit");
+            supervise_process(sandbox, false);
+            return 1;
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     struct config cfg = { .user = "admin" };
+    struct network_helper network_helper = { .pid = -1, .exit_fd = -1 };
+    struct network_sync child_network_sync = { .ready_fd = -1, .gate_fd = -1 };
+    int network_ready_pipe[2] = { -1, -1 };
+    int network_gate_pipe[2] = { -1, -1 };
     char **cmd;
     char *root;
     pid_t pid;
@@ -1572,6 +2009,10 @@ int main(int argc, char **argv)
     cmd = parse_args(argc, argv, &cfg);
     finalize_config(&cfg);
     root = make_temp_root();
+    if (cfg.network == NETWORK_INTERNET) {
+        make_cloexec_pipe(network_ready_pipe);
+        make_cloexec_pipe(network_gate_pipe);
+    }
     install_forward_signal_handlers();
     pid = fork_process();
 
@@ -1581,10 +2022,38 @@ int main(int argc, char **argv)
     if (pid == 0) {
         pending_signal = 0;
         block_forward_signals();
-        _exit(child_main(&cfg, root, cmd));
+        if (cfg.network == NETWORK_INTERNET) {
+            close(network_ready_pipe[0]);
+            close(network_gate_pipe[1]);
+            child_network_sync.ready_fd = network_ready_pipe[1];
+            child_network_sync.gate_fd = network_gate_pipe[0];
+        }
+        _exit(child_main(&cfg, root, cmd,
+                         cfg.network == NETWORK_INTERNET
+                             ? &child_network_sync : NULL));
     }
 
-    status = supervise_process(pid, false);
+    if (cfg.network == NETWORK_INTERNET) {
+        bool namespace_ready;
+
+        close(network_ready_pipe[1]);
+        close(network_gate_pipe[0]);
+        namespace_ready = read_readiness_byte(network_ready_pipe[0], pid);
+        close(network_ready_pipe[0]);
+        if (!namespace_ready) {
+            close(network_gate_pipe[1]);
+            status = wait_for_process(pid);
+        } else if (!launch_network_helper(pid, &network_helper)) {
+            kill_blocked_sandbox(pid);
+            close(network_gate_pipe[1]);
+            status = 1;
+        } else {
+            close(network_gate_pipe[1]);
+            status = supervise_networked_process(pid, &network_helper);
+        }
+    } else {
+        status = supervise_process(pid, false);
+    }
     restore_forward_signal_handlers();
 
     if (rmdir(root) < 0)
