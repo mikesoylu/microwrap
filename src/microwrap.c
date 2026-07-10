@@ -480,10 +480,11 @@ static void mount_bind(const char *src, const char *target, bool readonly)
     ensure_bind_target(target, &st);
 
     if (mount(src, target, NULL, MS_BIND, NULL) < 0)
-        die_errno("bind mount");
+        die("bind mount %s to %s: %s", src, target, strerror(errno));
 
-    if (readonly && mount(NULL, target, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0)
-        die_errno("remount read-only");
+    if (readonly && mount(NULL, target, NULL,
+                          MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0)
+        die("remount %s read-only: %s", target, strerror(errno));
 }
 
 static void mount_tmpfs_with_options(const char *target, const char *options)
@@ -738,12 +739,33 @@ static bool same_path(const char *a, const char *b)
     return a_len == b_len && memcmp(a, b, a_len) == 0;
 }
 
+static bool path_is_below(const char *path, const char *parent)
+{
+    size_t path_len = strlen(path);
+    size_t parent_len = strlen(parent);
+
+    while (path_len > 1 && path[path_len - 1] == '/')
+        path_len--;
+    while (parent_len > 1 && parent[parent_len - 1] == '/')
+        parent_len--;
+    if (path_len <= parent_len || memcmp(path, parent, parent_len) != 0)
+        return false;
+    return parent_len == 1 || path[parent_len] == '/';
+}
+
+static bool op_covers_children(const struct op *op)
+{
+    return op->type != OP_DIR;
+}
+
 static bool target_is_overridden(const struct config *cfg, const char *path)
 {
     for (size_t i = 0; i < cfg->len; i++) {
         const char *target = op_target(&cfg->ops[i]);
 
-        if (target && same_path(target, path))
+        if (target && (same_path(target, path) ||
+                       (op_covers_children(&cfg->ops[i]) &&
+                        path_is_below(path, target))))
             return true;
     }
     return false;
@@ -762,12 +784,11 @@ static char *append_path(const char *base, const char *suffix)
 
 static char *runtime_dir(const struct config *cfg)
 {
-    size_t len = strlen("/tmp/runtime-") + strlen(cfg->user) + 1;
-    char *path = malloc(len);
+    char *path = malloc(64);
 
     if (!path)
         die_errno("malloc");
-    snprintf(path, len, "/tmp/runtime-%s", cfg->user);
+    snprintf(path, 64, "/run/user/%lu", (unsigned long)cfg->uid);
     return path;
 }
 
@@ -778,6 +799,25 @@ static void mkdir_inside(const char *root, const char *path, mode_t mode)
     mkdir_p(target, mode);
     if (chmod(target, mode) < 0)
         die_errno(target);
+    free(target);
+}
+
+static void default_dir(const struct config *cfg, const char *root,
+                        const char *path, mode_t mode)
+{
+    if (!target_is_overridden(cfg, path))
+        mkdir_inside(root, path, mode);
+}
+
+static void default_symlink(const struct config *cfg, const char *root,
+                            const char *link_target, const char *path)
+{
+    char *target;
+
+    if (target_is_overridden(cfg, path))
+        return;
+    target = join_under_root(root, path);
+    make_symlink(link_target, target);
     free(target);
 }
 
@@ -861,6 +901,27 @@ static void default_bind_path(const struct config *cfg, const char *root,
     free(target);
 }
 
+static void default_recursive_bind_path(const struct config *cfg,
+                                        const char *root, const char *path)
+{
+    struct stat st;
+    char *target;
+
+    if (target_is_overridden(cfg, path))
+        return;
+    if (stat(path, &st) < 0) {
+        if (errno == ENOENT)
+            return;
+        die_errno(path);
+    }
+
+    target = join_under_root(root, path);
+    ensure_bind_target(target, &st);
+    if (mount(path, target, NULL, MS_BIND | MS_REC, NULL) < 0)
+        die("recursive bind mount %s to %s: %s", path, target, strerror(errno));
+    free(target);
+}
+
 static void setup_account_files(const struct config *cfg, const char *root)
 {
     static const char nsswitch[] =
@@ -907,7 +968,12 @@ static void setup_default_filesystem(const struct config *cfg, const char *root)
         "/usr", "/bin", "/sbin", "/lib", "/lib64",
     };
     static const char *device_paths[] = {
-        "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty",
+        "/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom",
+        "/dev/tty", "/dev/pts", "/dev/ptmx",
+    };
+    static const char *sys_paths[] = {
+        "/sys/block", "/sys/bus", "/sys/class", "/sys/dev", "/sys/devices",
+        "/sys/fs/cgroup", "/sys/kernel",
     };
     static const char *etc_paths[] = {
         "/etc/hosts",
@@ -936,21 +1002,52 @@ static void setup_default_filesystem(const struct config *cfg, const char *root)
 
     for (size_t i = 0; i < sizeof(system_paths) / sizeof(system_paths[0]); i++)
         mirror_host_path(cfg, root, system_paths[i]);
+    default_recursive_bind_path(cfg, root, "/proc");
+    for (size_t i = 0; i < sizeof(sys_paths) / sizeof(sys_paths[0]); i++)
+        default_bind_path(cfg, root, sys_paths[i]);
     for (size_t i = 0; i < sizeof(device_paths) / sizeof(device_paths[0]); i++)
         default_bind_path(cfg, root, device_paths[i]);
-    mirror_resolved_path(cfg, root, "/etc/resolv.conf");
-    for (size_t i = 0; i < sizeof(etc_paths) / sizeof(etc_paths[0]); i++)
-        mirror_host_path(cfg, root, etc_paths[i]);
+
+    default_symlink(cfg, root, "/proc/self/fd", "/dev/fd");
+    default_symlink(cfg, root, "/proc/self/fd/0", "/dev/stdin");
+    default_symlink(cfg, root, "/proc/self/fd/1", "/dev/stdout");
+    default_symlink(cfg, root, "/proc/self/fd/2", "/dev/stderr");
 
     if (!target_is_overridden(cfg, "/tmp")) {
         target = join_under_root(root, "/tmp");
         mount_tmpfs_with_options(target, "mode=1777");
         free(target);
+    }
 
-        char *runtime = runtime_dir(cfg);
+    if (!target_is_overridden(cfg, "/run")) {
+        char *runtime;
+
+        target = join_under_root(root, "/run");
+        mount_tmpfs_with_options(target, "mode=0755");
+        free(target);
+
+        default_dir(cfg, root, "/run/lock", 0755);
+        default_dir(cfg, root, "/run/user", 0755);
+        runtime = runtime_dir(cfg);
         mkdir_inside(root, runtime, 0700);
         free(runtime);
     }
+
+    if (!target_is_overridden(cfg, "/dev/shm")) {
+        target = join_under_root(root, "/dev/shm");
+        mount_tmpfs_with_options(target, "mode=1777");
+        free(target);
+    }
+
+    default_dir(cfg, root, "/var", 0755);
+    if (!target_is_overridden(cfg, "/var/tmp")) {
+        target = join_under_root(root, "/var/tmp");
+        mount_tmpfs_with_options(target, "mode=1777");
+        free(target);
+    }
+    default_symlink(cfg, root, "/run", "/var/run");
+    default_symlink(cfg, root, "/run/lock", "/var/lock");
+    default_dir(cfg, root, "/mnt", 0755);
 
     if (!target_is_overridden(cfg, cfg->home)) {
         target = join_under_root(root, cfg->home);
@@ -963,6 +1060,10 @@ static void setup_default_filesystem(const struct config *cfg, const char *root)
             free(path);
         }
     }
+
+    mirror_resolved_path(cfg, root, "/etc/resolv.conf");
+    for (size_t i = 0; i < sizeof(etc_paths) / sizeof(etc_paths[0]); i++)
+        mirror_host_path(cfg, root, etc_paths[i]);
 
     setup_account_files(cfg, root);
 }
