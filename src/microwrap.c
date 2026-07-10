@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <linux/capability.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -63,6 +64,7 @@ struct config {
     char *home;
     const char *workdir;
     bool no_userns;
+    bool share_pid;
     bool clear_env;
     bool no_defaults;
 };
@@ -203,6 +205,7 @@ static void usage(FILE *out)
         "  --clearenv           clear inherited variables before adding defaults\n"
         "  --no-defaults        disable automatic mounts, account files, and env\n"
         "  --no-userns          skip user namespace setup; requires CAP_SYS_ADMIN\n"
+        "  --share-pid          share the caller's PID namespace and procfs\n"
         "  --help               show this help\n");
 }
 
@@ -301,6 +304,8 @@ static char **parse_args(int argc, char **argv, struct config *cfg)
             cfg->no_defaults = true;
         } else if (strcmp(arg, "--no-userns") == 0) {
             cfg->no_userns = true;
+        } else if (strcmp(arg, "--share-pid") == 0) {
+            cfg->share_pid = true;
         } else if (strcmp(arg, "--help") == 0) {
             usage(stdout);
             exit(0);
@@ -600,6 +605,9 @@ static void setup_namespaces(const struct config *cfg)
 
     if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0)
         die_errno("make mounts private");
+
+    if (!cfg->share_pid && unshare(CLONE_NEWPID) < 0)
+        die_errno("unshare(CLONE_NEWPID)");
 }
 
 static void drop_caps(void)
@@ -922,6 +930,104 @@ static void default_recursive_bind_path(const struct config *cfg,
     free(target);
 }
 
+static void remount_bind_readonly(const char *target)
+{
+    if (mount(NULL, target, NULL,
+              MS_BIND | MS_REMOUNT | MS_RDONLY |
+              MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0)
+        die("remount %s read-only: %s", target, strerror(errno));
+}
+
+static void mask_default_path(const struct config *cfg, const char *root,
+                              const char *path)
+{
+    struct stat st;
+    char *target;
+
+    if (target_is_overridden(cfg, path))
+        return;
+    target = join_under_root(root, path);
+    if (lstat(target, &st) < 0) {
+        if (errno == ENOENT) {
+            free(target);
+            return;
+        }
+        die_errno(target);
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        if (mount("tmpfs", target, "tmpfs",
+                  MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                  "mode=000,size=0") < 0)
+            die("mask %s: %s", target, strerror(errno));
+    } else {
+        if (mount("/dev/null", target, NULL, MS_BIND, NULL) < 0)
+            die("mask %s: %s", target, strerror(errno));
+        remount_bind_readonly(target);
+    }
+    free(target);
+}
+
+static void make_default_path_readonly(const struct config *cfg,
+                                       const char *root, const char *path)
+{
+    struct stat st;
+    unsigned long flags = MS_BIND;
+    char *target;
+
+    if (target_is_overridden(cfg, path))
+        return;
+    target = join_under_root(root, path);
+    if (lstat(target, &st) < 0) {
+        if (errno == ENOENT) {
+            free(target);
+            return;
+        }
+        die_errno(target);
+    }
+    if (S_ISDIR(st.st_mode))
+        flags |= MS_REC;
+    if (mount(target, target, NULL, flags, NULL) < 0)
+        die("bind %s read-only: %s", target, strerror(errno));
+    remount_bind_readonly(target);
+    free(target);
+}
+
+static void setup_default_procfs(const struct config *cfg, const char *root)
+{
+    static const char *masked_paths[] = {
+        "/proc/acpi",
+        "/proc/asound",
+        "/proc/interrupts",
+        "/proc/kcore",
+        "/proc/keys",
+        "/proc/latency_stats",
+        "/proc/sched_debug",
+        "/proc/scsi",
+        "/proc/timer_list",
+        "/proc/timer_stats",
+    };
+    static const char *readonly_paths[] = {
+        "/proc/sysrq-trigger",
+        "/proc/bus",
+        "/proc/fs",
+        "/proc/irq",
+        "/proc/sys",
+    };
+    char *target;
+
+    if (target_is_overridden(cfg, "/proc"))
+        return;
+    target = join_under_root(root, "/proc");
+    mount_procfs(target);
+    free(target);
+
+    for (size_t i = 0; i < sizeof(masked_paths) / sizeof(masked_paths[0]); i++)
+        mask_default_path(cfg, root, masked_paths[i]);
+    for (size_t i = 0; i < sizeof(readonly_paths) / sizeof(readonly_paths[0]); i++)
+        make_default_path_readonly(cfg, root, readonly_paths[i]);
+}
+
 static void setup_account_files(const struct config *cfg, const char *root)
 {
     static const char nsswitch[] =
@@ -1002,7 +1108,10 @@ static void setup_default_filesystem(const struct config *cfg, const char *root)
 
     for (size_t i = 0; i < sizeof(system_paths) / sizeof(system_paths[0]); i++)
         mirror_host_path(cfg, root, system_paths[i]);
-    default_recursive_bind_path(cfg, root, "/proc");
+    if (cfg->share_pid)
+        default_recursive_bind_path(cfg, root, "/proc");
+    else
+        setup_default_procfs(cfg, root);
     for (size_t i = 0; i < sizeof(sys_paths) / sizeof(sys_paths[0]); i++)
         default_bind_path(cfg, root, sys_paths[i]);
     for (size_t i = 0; i < sizeof(device_paths) / sizeof(device_paths[0]); i++)
@@ -1133,10 +1242,114 @@ static void setup_environment(const struct config *cfg)
     }
 }
 
-static void child_main(const struct config *cfg, const char *root, char **cmd)
-{
-    setup_namespaces(cfg);
+struct forwarded_signal {
+    int number;
+    struct sigaction previous;
+};
 
+static struct forwarded_signal forwarded_signals[] = {
+    { .number = SIGHUP },
+    { .number = SIGINT },
+    { .number = SIGQUIT },
+    { .number = SIGTERM },
+    { .number = SIGALRM },
+    { .number = SIGUSR1 },
+    { .number = SIGUSR2 },
+    { .number = SIGCONT },
+    { .number = SIGWINCH },
+};
+static volatile sig_atomic_t pending_signal;
+static sigset_t forwarded_signal_mask;
+static sigset_t original_signal_mask;
+
+static void remember_signal(int signal_number)
+{
+    pending_signal = signal_number;
+}
+
+static void install_forward_signal_handlers(void)
+{
+    struct sigaction action;
+
+    if (sigprocmask(SIG_SETMASK, NULL, &original_signal_mask) < 0)
+        die_errno("sigprocmask get");
+    sigemptyset(&forwarded_signal_mask);
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = remember_signal;
+    sigemptyset(&action.sa_mask);
+
+    for (size_t i = 0;
+         i < sizeof(forwarded_signals) / sizeof(forwarded_signals[0]); i++) {
+        sigaddset(&forwarded_signal_mask, forwarded_signals[i].number);
+        if (sigaction(forwarded_signals[i].number, &action,
+                      &forwarded_signals[i].previous) < 0)
+            die_errno("sigaction");
+    }
+}
+
+static void block_forward_signals(void)
+{
+    if (sigprocmask(SIG_BLOCK, &forwarded_signal_mask, NULL) < 0)
+        die_errno("sigprocmask block");
+}
+
+static void restore_signal_mask(void)
+{
+    if (sigprocmask(SIG_SETMASK, &original_signal_mask, NULL) < 0)
+        die_errno("sigprocmask restore");
+}
+
+static void restore_forward_signal_handlers(void)
+{
+    for (size_t i = 0;
+         i < sizeof(forwarded_signals) / sizeof(forwarded_signals[0]); i++) {
+        if (sigaction(forwarded_signals[i].number,
+                      &forwarded_signals[i].previous, NULL) < 0)
+            die_errno("sigaction restore");
+    }
+}
+
+static int wait_status_code(int status)
+{
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+    return 1;
+}
+
+static void forward_pending_signal(pid_t child)
+{
+    int signal_number = pending_signal;
+
+    if (!signal_number)
+        return;
+    pending_signal = 0;
+    if (kill(child, signal_number) < 0 && errno != ESRCH)
+        die("forward signal %d: %s", signal_number, strerror(errno));
+}
+
+static int supervise_process(pid_t child, bool reap_orphans)
+{
+    int status;
+
+    for (;;) {
+        pid_t waited;
+
+        forward_pending_signal(child);
+        waited = waitpid(reap_orphans ? -1 : child, &status, 0);
+        if (waited < 0) {
+            if (errno == EINTR)
+                continue;
+            die_errno("waitpid");
+        }
+        if (waited == child)
+            return wait_status_code(status);
+    }
+}
+
+static void setup_sandbox(const struct config *cfg, const char *root)
+{
     if (mount("tmpfs", root, "tmpfs", MS_NOSUID | MS_NODEV, "mode=755") < 0)
         die_errno("root tmpfs mount");
 
@@ -1161,9 +1374,51 @@ static void child_main(const struct config *cfg, const char *root, char **cmd)
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
         die_errno("prctl(PR_SET_NO_NEW_PRIVS)");
     drop_caps();
+}
+
+static void exec_command(char **cmd)
+{
+    restore_forward_signal_handlers();
+    restore_signal_mask();
 
     execvp(cmd[0], cmd);
     die_errno(cmd[0]);
+}
+
+static int pid_namespace_main(const struct config *cfg, const char *root,
+                              char **cmd)
+{
+    pid_t pid;
+
+    setup_sandbox(cfg, root);
+    pid = fork();
+    if (pid < 0)
+        die_errno("fork command");
+    if (pid == 0)
+        exec_command(cmd);
+    restore_signal_mask();
+    return supervise_process(pid, true);
+}
+
+static int child_main(const struct config *cfg, const char *root, char **cmd)
+{
+    pid_t pid;
+
+    setup_namespaces(cfg);
+    if (cfg->share_pid) {
+        setup_sandbox(cfg, root);
+        exec_command(cmd);
+    }
+
+    pid = fork();
+    if (pid < 0)
+        die_errno("fork PID namespace init");
+    if (pid == 0) {
+        pending_signal = 0;
+        _exit(pid_namespace_main(cfg, root, cmd));
+    }
+    restore_signal_mask();
+    return supervise_process(pid, false);
 }
 
 static char *make_temp_root(void)
@@ -1201,19 +1456,20 @@ int main(int argc, char **argv)
     cmd = parse_args(argc, argv, &cfg);
     finalize_config(&cfg);
     root = make_temp_root();
+    install_forward_signal_handlers();
     pid = fork();
 
     if (pid < 0)
         die_errno("fork");
 
-    if (pid == 0)
-        child_main(&cfg, root, cmd);
-
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR)
-            continue;
-        die_errno("waitpid");
+    if (pid == 0) {
+        pending_signal = 0;
+        block_forward_signals();
+        _exit(child_main(&cfg, root, cmd));
     }
+
+    status = supervise_process(pid, false);
+    restore_forward_signal_handlers();
 
     if (rmdir(root) < 0)
         fprintf(stderr, "microwrap: warning: failed to remove %s: %s\n", root, strerror(errno));
@@ -1223,9 +1479,5 @@ int main(int argc, char **argv)
     free(cfg.env_ops);
     free(cfg.ops);
 
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-    if (WIFSIGNALED(status))
-        return 128 + WTERMSIG(status);
-    return 1;
+    return status;
 }

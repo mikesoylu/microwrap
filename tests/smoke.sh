@@ -14,7 +14,15 @@ if [ ! -x "$WRAP" ]; then
 fi
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT HUP TERM
+outside_pid=
+wrapper_pid=
+cleanup()
+{
+    [ -z "$wrapper_pid" ] || kill "$wrapper_pid" 2>/dev/null || true
+    [ -z "$outside_pid" ] || kill "$outside_pid" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+trap cleanup EXIT INT HUP TERM
 caller_uid=$(id -u)
 caller_gid=$(id -g)
 
@@ -57,6 +65,79 @@ if [ -x /bin/bash ]; then
     '
 fi
 
+echo "PID namespace and supervision"
+sleep 30 &
+outside_pid=$!
+HOST_PID=$outside_pid "$WRAP" -- /bin/sh -c '
+    set -eu
+    test "$$" = 2
+    test "$PPID" = 1
+    test "$(cat /proc/1/comm)" = microwrap
+    test ! -e "/proc/$HOST_PID/status"
+    if kill -0 "$HOST_PID" 2>/dev/null; then
+        exit 1
+    fi
+'
+HOST_PID=$outside_pid "$WRAP" --share-pid -- /bin/sh -c '
+    set -eu
+    test -r "/proc/$HOST_PID/status"
+    kill -0 "$HOST_PID"
+'
+kill "$outside_pid"
+wait "$outside_pid" 2>/dev/null || true
+outside_pid=
+
+if "$WRAP" -- /bin/sh -c 'exit 42'; then
+    echo "nonzero command unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" = 42
+fi
+
+"$WRAP" --bind "$tmp" /out -- /bin/sh -c '
+    trap "echo TERM >/out/signal; exit 23" TERM
+    echo ready >/out/ready
+    while :; do sleep 1; done
+' &
+wrapper_pid=$!
+i=0
+while [ ! -f "$tmp/ready" ] && [ "$i" -lt 100 ]; do
+    sleep 0.05
+    i=$((i + 1))
+done
+test -f "$tmp/ready"
+kill -TERM "$wrapper_pid"
+if wait "$wrapper_pid"; then
+    signal_status=0
+else
+    signal_status=$?
+fi
+wrapper_pid=
+test "$signal_status" = 23
+test "$(cat "$tmp/signal")" = TERM
+
+"$WRAP" --bind /proc /hostproc --bind "$tmp" /out -- /bin/sh -c '
+    set -eu
+    sleep 30 & child=$!
+    for status in /hostproc/[0-9]*/status; do
+        nspid=$(grep "^NSpid:" "$status" || true)
+        last=
+        for value in $nspid; do last=$value; done
+        if [ "$last" = "$child" ]; then
+            host_pid=${status#/hostproc/}
+            host_pid=${host_pid%/status}
+            echo "$host_pid" >/out/descendant-pid
+            break
+        fi
+    done
+    test -s /out/descendant-pid
+'
+descendant_pid=$(cat "$tmp/descendant-pid")
+if kill -0 "$descendant_pid" 2>/dev/null; then
+    echo "descendant survived namespace init exit" >&2
+    exit 1
+fi
+
 echo "proc, sys, and standard devices"
 "$WRAP" -- /bin/sh -c '
     set -eu
@@ -77,12 +158,15 @@ echo "proc, sys, and standard devices"
     test -d /dev/shm
     touch /dev/shm/write-test
 '
-if awk '$5 == "/proc/sys" { found = 1 } END { exit !found }' /proc/self/mountinfo; then
-    "$WRAP" -- /usr/bin/awk \
-        '$5 == "/proc/sys" && $6 ~ /^ro(,|$)/ { found = 1 }
-         END { exit !found }' \
-        /proc/self/mountinfo
-fi
+"$WRAP" -- /bin/sh -c '
+    set -eu
+    awk '\''$5 == "/proc/sys" && $6 ~ /^ro(,|$)/ { found = 1 }
+          END { exit !found }'\'' /proc/self/mountinfo
+    awk '\''$5 == "/proc/sysrq-trigger" && $6 ~ /^ro(,|$)/ { found = 1 }
+          END { exit !found }'\'' /proc/self/mountinfo
+    test -c /proc/kcore
+    test "$(stat -c %t:%T /proc/kcore)" = 1:3
+'
 
 echo "standard runtime directories"
 "$WRAP" -- /bin/sh -c '

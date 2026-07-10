@@ -6,7 +6,7 @@ root filesystem, map folders, then run a command. It provides practical shell
 defaults while keeping every filesystem mapping explicit or replaceable.
 
 It is intentionally not a full sandbox. There is no seccomp, cgroups, device
-policy, network setup, PID namespace handling, or desktop/session integration.
+policy, network setup, or desktop/session integration.
 
 ## Build
 
@@ -75,19 +75,23 @@ Runtime options:
   --clearenv           Clear inherited variables before adding defaults.
   --no-defaults        Disable automatic mounts, account files, and env.
   --no-userns          Do not create a user namespace. Requires CAP_SYS_ADMIN.
+  --share-pid          Share the caller's PID namespace and procfs.
   --help               Show usage.
 ```
 
 By default, `microwrap` creates a user namespace and maps the caller's numeric
-UID and primary GID to the same IDs inside it. It then creates a private mount
-namespace and mounts a fresh tmpfs as the new root. It maps the host's `/usr`
-and loader paths read-only, binds the current procfs and selected sysfs views,
-and provides standard devices, fd links, devpts, and shared memory. It creates
-fresh tmpfs mounts at `/tmp`, `/run`, `/var/tmp`, and `/home/admin`, writes
-minimal passwd/group data, maps common DNS, certificate, loader, and timezone
+UID and primary GID to the same IDs inside it. It then creates private mount
+and PID namespaces and mounts a fresh tmpfs as the new root. A small microwrap
+process runs as PID 1, forwards signals, reaps orphaned children, and supervises
+the requested command as PID 2. Microwrap maps the host's `/usr` and loader
+paths read-only, mounts a private procfs, binds selected sysfs views, and
+provides standard devices, fd links, devpts, and shared memory. It creates fresh
+tmpfs mounts at `/tmp`, `/run`, `/var/tmp`, and `/home/admin`, writes minimal
+passwd/group data, maps common DNS, certificate, loader, and timezone
 configuration from `/etc`, and sets a login-like environment. An explicit
 operation at one of those destinations replaces that default. After setup it
-chroots, drops capabilities, sets `no_new_privs`, and execs the command.
+chroots, drops capabilities, sets `no_new_privs`, then forks and execs the
+command.
 
 ## Test
 
@@ -137,12 +141,11 @@ Use the original empty-root behavior and specify every mapping yourself:
 ```
 
 If you are running with real `CAP_SYS_ADMIN`, you can skip the user namespace
-and mount a fresh procfs:
+while retaining the default mount and PID isolation:
 
 ```sh
 ./microwrap \
   --no-userns \
-  --proc /proc \
   -- /bin/sh -c 'ls /proc/self'
 ```
 
@@ -157,10 +160,14 @@ and mount a fresh procfs:
 - `--user` is cosmetic. The process keeps the caller's numeric UID and primary
   GID; the name, home, account files, working directory, and environment change.
 - Supplementary host groups are not mapped into the user namespace.
-- The default `/proc` is a bind of the caller's current procfs, so it shows the
-  same PID namespace rather than providing PID isolation. Use `--dir /proc` to
-  leave it empty. A fresh `--proc /proc` mount may require `--no-userns` because
-  microwrap does not create a PID namespace.
+- The default `/proc` belongs to the new PID namespace. Sensitive kernel paths
+  are masked and `/proc/sys`, `/proc/sysrq-trigger`, `/proc/irq`, `/proc/bus`,
+  and `/proc/fs` are read-only. Use `--dir /proc` to leave procfs empty.
+- `--share-pid` disables PID isolation and recursively binds the caller's
+  procfs, including its existing masked and read-only submounts. This exposes
+  host PIDs and restores the pre-PID-namespace behavior.
+- The requested command runs as PID 2 under microwrap's minimal PID 1. When the
+  command exits, remaining processes in the PID namespace are terminated.
 - Selected `/sys` subtrees are bound for CPU, device, and cgroup introspection.
   Use `--tmpfs /sys` or `--no-defaults` to hide them.
 - `/dev/tty` and devpts are available, but opening `/dev/tty` still requires the
@@ -173,4 +180,4 @@ and mount a fresh procfs:
   when the wrapped command exits; `/usr` and mapped runtime configuration remain
   read-only. Setuid execution cannot elevate privileges because `no_new_privs`
   is set before exec.
-- The process still shares the host PID, IPC, UTS, and network namespaces.
+- The process still shares the host IPC, UTS, and network namespaces.
