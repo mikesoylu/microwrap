@@ -114,6 +114,9 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
       - name: Download tested artifacts
         uses: actions/download-artifact@v8
         with:
