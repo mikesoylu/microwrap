@@ -98,12 +98,13 @@ jobs:
             "build/${package}/microwrap"
           install -m 0644 README.md "build/${package}/README.md"
           tar -C build -czf "dist/${package}.tar.gz" "${package}"
+          install -m 0755 "build/microwrap-linux-${ARCH}" "dist/${package}"
 
       - name: Upload tested artifact
         uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.arch }}
-          path: dist/*.tar.gz
+          path: dist/microwrap-*
           if-no-files-found: error
           retention-days: 1
 
@@ -126,7 +127,7 @@ jobs:
 
       - name: Create checksums
         shell: bash
-        run: (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+        run: (cd dist && sha256sum ./microwrap-* > SHA256SUMS)
 
       - name: Create GitHub release
         shell: bash
@@ -136,12 +137,12 @@ jobs:
           RELEASE_TAG="sha-${GITHUB_SHA::12}"
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" \
-              dist/*.tar.gz \
+              dist/microwrap-* \
               dist/SHA256SUMS \
               --clobber
           else
             gh release create "${RELEASE_TAG}" \
-              dist/*.tar.gz \
+              dist/microwrap-* \
               dist/SHA256SUMS \
               --target "${GITHUB_SHA}" \
               --generate-notes \

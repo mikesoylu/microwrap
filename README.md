@@ -29,20 +29,28 @@ make release RELEASE_MAX_PAGE_SIZE=65536
 
 The only build requirement is a Linux C toolchain and libc headers.
 
-## Releases
+## Install
 
-Every push to `main` builds and publishes a release named after the first 12
-characters of the commit SHA, such as `sha-dc50e4d12345`. The release points to
-the full commit SHA; its Linux archives target EC2 `amd64` instances and
-ARM64/Graviton instances. The binaries are tested on Debian and Amazon Linux
-2023 and do not depend on the target system's libc.
+Install the latest tested release to `/usr/local/bin`:
 
-Release assets are named:
+```sh
+curl -fsSL https://raw.githubusercontent.com/mikesoylu/microwrap/main/setup.sh | sudo sh
+```
 
-```text
-microwrap-sha-COMMIT-linux-amd64.tar.gz
-microwrap-sha-COMMIT-linux-arm64.tar.gz
-SHA256SUMS
+For a user-local installation, make sure `$HOME/.local/bin` is on `PATH` and
+choose that prefix:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mikesoylu/microwrap/main/setup.sh | \
+  sh -s -- --prefix "$HOME/.local"
+```
+
+The installer detects `amd64` and ARM64/Graviton machines and verifies the
+release checksum before installing. A SHA release can be selected explicitly:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mikesoylu/microwrap/main/setup.sh | \
+  sudo sh -s -- --release sha-b54344a2d043
 ```
 
 ## Usage
