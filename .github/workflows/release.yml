@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - microwrap.c
+      - test-isolation.c
       - test-network.c
       - test.sh
       - Makefile
