@@ -7,14 +7,20 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/audit.h>
 #include <linux/if.h>
 #include <linux/capability.h>
+#include <linux/filter.h>
+#include <linux/keyctl.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <linux/seccomp.h>
+#include <poll.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,9 +79,11 @@ struct config {
     gid_t gid;
     char *home;
     const char *workdir;
+    const char *tmpfs_size;
     enum network_mode network;
     bool no_userns;
     bool share_pid;
+    bool share_ipc;
     bool clear_env;
     bool no_defaults;
 };
@@ -311,6 +319,23 @@ static bool valid_env_name(const char *name)
     return true;
 }
 
+/* Digits with an optional k/m/g/% suffix; rejects 0 (unlimited) and extra options. */
+static bool valid_tmpfs_size(const char *size)
+{
+    const char *p = size;
+    bool nonzero = false;
+
+    if (*p < '0' || *p > '9')
+        return false;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        if (*p != '0')
+            nonzero = true;
+    }
+    if (*p && strchr("kKmMgG%", *p))
+        p++;
+    return nonzero && *p == '\0' && p - size <= 24;
+}
+
 static void finalize_config(struct config *cfg)
 {
     size_t len;
@@ -439,6 +464,14 @@ static char **parse_args(int argc, char **argv, struct config *cfg)
             cfg->no_userns = true;
         } else if (strcmp(arg, "--share-pid") == 0) {
             cfg->share_pid = true;
+        } else if (strcmp(arg, "--share-ipc") == 0) {
+            cfg->share_ipc = true;
+        } else if (strcmp(arg, "--tmpfs-size") == 0) {
+            if (i + 1 >= argc)
+                die("--tmpfs-size requires SIZE");
+            cfg->tmpfs_size = argv[++i];
+            if (!valid_tmpfs_size(cfg->tmpfs_size))
+                die("invalid tmpfs size: %s", cfg->tmpfs_size);
         } else if (strcmp(arg, "--network") == 0) {
             const char *mode;
 
@@ -636,16 +669,22 @@ static void mount_bind(const char *src, const char *target, bool readonly)
         die("remount %s read-only: errno %d", target, errno);
 }
 
-static void mount_tmpfs_with_options(const char *target, const char *options)
+static void mount_tmpfs_at(const char *target, const char *size)
 {
-    mkdir_p(target, 0755);
+    char options[64];
+
+    if (size)
+        format_text(options, sizeof(options), "mode=755,size=%s", size);
+    else
+        format_text(options, sizeof(options), "mode=755");
     if (mount("tmpfs", target, "tmpfs", MS_NOSUID | MS_NODEV, options) < 0)
-        die_errno("tmpfs mount");
+        die("tmpfs mount %s: errno %d", target, errno);
 }
 
-static void mount_tmpfs(const char *target)
+static void mount_tmpfs(const char *target, const char *size)
 {
-    mount_tmpfs_with_options(target, "mode=755");
+    mkdir_p(target, 0755);
+    mount_tmpfs_at(target, size);
 }
 
 static void mount_procfs(const char *target)
@@ -913,6 +952,9 @@ static void setup_namespaces(const struct config *cfg,
     if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0)
         die_errno("make mounts private");
 
+    if (!cfg->share_ipc && unshare(CLONE_NEWIPC) < 0)
+        die_errno("unshare(CLONE_NEWIPC)");
+
     if (!cfg->share_pid && unshare(CLONE_NEWPID) < 0)
         die_errno("unshare(CLONE_NEWPID)");
 
@@ -948,6 +990,134 @@ static void drop_caps(void)
 
     if (syscall(SYS_capset, &header, data) < 0)
         die_errno("capset");
+}
+
+/*
+ * Detach from the caller's session keyring so keys stored there, such as
+ * Kerberos or filesystem encryption keys, are not reachable in the wrapper.
+ */
+static void detach_session_keyring(void)
+{
+    if (syscall(SYS_keyctl, KEYCTL_JOIN_SESSION_KEYRING, NULL) >= 0)
+        return;
+    if (errno == ENOSYS)
+        return;
+    /* An outer policy that blocks keyctl also blocks it for the wrapper. */
+    if (errno == EPERM &&
+        syscall(SYS_keyctl, KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 0) < 0)
+        return;
+    die_errno("join new session keyring");
+}
+
+#ifndef SECCOMP_RET_KILL_PROCESS
+#define SECCOMP_RET_KILL_PROCESS SECCOMP_RET_KILL
+#endif
+
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define SECCOMP_ARG_LOW_WORD 0
+#else
+#define SECCOMP_ARG_LOW_WORD 4
+#endif
+
+/*
+ * The kernel truncates ioctl requests to 32 bits, so only the low word of
+ * the argument is compared; checking all 64 bits would allow a bypass.
+ */
+#define FILTER_IOCTL_REQUEST_LOW \
+    (offsetof(struct seccomp_data, args) + sizeof(uint64_t) + SECCOMP_ARG_LOW_WORD)
+
+/* Enter an architecture block that spans COUNT ioctl syscall numbers. */
+#define FILTER_ARCH(arch, count) \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (arch), 0, 2 + 6 * (count)), \
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr))
+
+/* With the syscall number loaded, reject terminal input injection ioctls. */
+#define FILTER_TTY_IOCTL(nr) \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr), 0, 5), \
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, FILTER_IOCTL_REQUEST_LOW), \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TIOCSTI, 1, 0), \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TIOCLINUX, 0, 1), \
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM), \
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
+
+#define FILTER_ALLOW BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
+
+#define X32_SYSCALL_BIT 0x40000000U
+
+/*
+ * TIOCSTI and TIOCLINUX can push input into the caller's terminal, which the
+ * caller's shell would run after the wrapper exits. Every syscall ABI the
+ * kernel can report for this CPU family is covered, because a wrapped
+ * process can execute binaries for any of them; anything else is killed.
+ */
+static void install_tty_filter(void)
+{
+    static struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+#if defined(__x86_64__) || defined(__i386__)
+        FILTER_ARCH(AUDIT_ARCH_X86_64, 3),
+        FILTER_TTY_IOCTL(16),
+        FILTER_TTY_IOCTL(X32_SYSCALL_BIT | 16),
+        FILTER_TTY_IOCTL(X32_SYSCALL_BIT | 514),
+        FILTER_ALLOW,
+        FILTER_ARCH(AUDIT_ARCH_I386, 1),
+        FILTER_TTY_IOCTL(54),
+        FILTER_ALLOW,
+#elif defined(__aarch64__) || defined(__arm__)
+        FILTER_ARCH(AUDIT_ARCH_AARCH64, 1),
+        FILTER_TTY_IOCTL(29),
+        FILTER_ALLOW,
+        FILTER_ARCH(AUDIT_ARCH_ARM, 1),
+        FILTER_TTY_IOCTL(54),
+        FILTER_ALLOW,
+#elif defined(__riscv)
+        FILTER_ARCH(AUDIT_ARCH_RISCV64, 1),
+        FILTER_TTY_IOCTL(29),
+        FILTER_ALLOW,
+        FILTER_ARCH(AUDIT_ARCH_RISCV32, 1),
+        FILTER_TTY_IOCTL(29),
+        FILTER_ALLOW,
+#elif defined(__powerpc__)
+        FILTER_ARCH(AUDIT_ARCH_PPC64LE, 1),
+        FILTER_TTY_IOCTL(54),
+        FILTER_ALLOW,
+        FILTER_ARCH(AUDIT_ARCH_PPC64, 1),
+        FILTER_TTY_IOCTL(54),
+        FILTER_ALLOW,
+        FILTER_ARCH(AUDIT_ARCH_PPC, 1),
+        FILTER_TTY_IOCTL(54),
+        FILTER_ALLOW,
+#elif defined(__s390__)
+        FILTER_ARCH(AUDIT_ARCH_S390X, 1),
+        FILTER_TTY_IOCTL(54),
+        FILTER_ALLOW,
+        FILTER_ARCH(AUDIT_ARCH_S390, 1),
+        FILTER_TTY_IOCTL(54),
+        FILTER_ALLOW,
+#elif defined(__loongarch64)
+        FILTER_ARCH(AUDIT_ARCH_LOONGARCH64, 1),
+        FILTER_TTY_IOCTL(29),
+        FILTER_ALLOW,
+#else
+#error "microwrap: add this architecture's syscall ABIs to install_tty_filter"
+#endif
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+    };
+    struct sock_fprog program = {
+        .len = sizeof(filter) / sizeof(filter[0]),
+        .filter = filter,
+    };
+
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program, 0, 0) == 0)
+        return;
+    /*
+     * Without seccomp filter support (for example under qemu-user or Rosetta
+     * emulation) leave the caller's session instead. The kernel then rejects
+     * TIOCSTI because the terminal is no longer the controlling terminal,
+     * at the cost of job control in interactive shells.
+     */
+    if (errno != EINVAL || setsid() < 0)
+        die_errno("install terminal ioctl filter");
 }
 
 static void ensure_stdio(void)
@@ -994,7 +1164,8 @@ static void close_extra_fds(void)
     close_fds_from(3);
 }
 
-static void apply_op(const char *root, const struct op *op)
+static void apply_op(const struct config *cfg, const char *root,
+                     const struct op *op)
 {
     char *target;
 
@@ -1011,7 +1182,7 @@ static void apply_op(const char *root, const struct op *op)
         break;
     case OP_TMPFS:
         target = join_under_root(root, op->a);
-        mount_tmpfs(target);
+        mount_tmpfs(target, cfg->tmpfs_size);
         free(target);
         break;
     case OP_PROC:
@@ -1386,6 +1557,28 @@ static void setup_network_sysfs(const struct config *cfg, const char *root)
     free(scratch);
 }
 
+/*
+ * A private devpts instance keeps the caller's other terminals out of reach.
+ * Terminals inherited on stdio keep working through their open descriptors.
+ */
+static void setup_default_devpts(const struct config *cfg, const char *root)
+{
+    char *target;
+
+    if (target_is_overridden(cfg, "/dev/pts")) {
+        default_bind_path(cfg, root, "/dev/ptmx");
+        return;
+    }
+
+    target = join_under_root(root, "/dev/pts");
+    mkdir_p(target, 0755);
+    if (mount("devpts", target, "devpts", MS_NOSUID | MS_NOEXEC,
+              "newinstance,ptmxmode=0666,mode=620") < 0)
+        die("devpts mount %s: errno %d", target, errno);
+    free(target);
+    default_symlink(cfg, root, "pts/ptmx", "/dev/ptmx");
+}
+
 static void setup_account_files(const struct config *cfg, const char *root)
 {
     static const char nsswitch[] =
@@ -1434,7 +1627,7 @@ static void setup_default_filesystem(const struct config *cfg, const char *root)
     };
     static const char *device_paths[] = {
         "/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom",
-        "/dev/tty", "/dev/pts", "/dev/ptmx",
+        "/dev/tty",
     };
     static const char *sys_paths[] = {
         "/sys/block", "/sys/bus", "/sys/class", "/sys/dev", "/sys/devices",
@@ -1476,25 +1669,23 @@ static void setup_default_filesystem(const struct config *cfg, const char *root)
     setup_network_sysfs(cfg, root);
     for (size_t i = 0; i < sizeof(device_paths) / sizeof(device_paths[0]); i++)
         default_bind_path(cfg, root, device_paths[i]);
+    setup_default_devpts(cfg, root);
 
     default_symlink(cfg, root, "/proc/self/fd", "/dev/fd");
     default_symlink(cfg, root, "/proc/self/fd/0", "/dev/stdin");
     default_symlink(cfg, root, "/proc/self/fd/1", "/dev/stdout");
     default_symlink(cfg, root, "/proc/self/fd/2", "/dev/stderr");
 
-    if (!target_is_overridden(cfg, "/tmp")) {
-        target = join_under_root(root, "/tmp");
-        mount_tmpfs_with_options(target, "mode=1777");
-        free(target);
-    }
+    /*
+     * Scratch areas are directories on the root tmpfs rather than separate
+     * mounts, so they share one size limit instead of each getting their own.
+     */
+    default_dir(cfg, root, "/tmp", 01777);
 
     if (!target_is_overridden(cfg, "/run")) {
         char *runtime;
 
-        target = join_under_root(root, "/run");
-        mount_tmpfs_with_options(target, "mode=0755");
-        free(target);
-
+        mkdir_inside(root, "/run", 0755);
         default_dir(cfg, root, "/run/lock", 0755);
         default_dir(cfg, root, "/run/user", 0755);
         runtime = runtime_dir(cfg);
@@ -1502,27 +1693,22 @@ static void setup_default_filesystem(const struct config *cfg, const char *root)
         free(runtime);
     }
 
-    if (!target_is_overridden(cfg, "/dev/shm")) {
-        target = join_under_root(root, "/dev/shm");
-        mount_tmpfs_with_options(target, "mode=1777");
-        free(target);
-    }
-
+    default_dir(cfg, root, "/dev/shm", 01777);
     default_dir(cfg, root, "/var", 0755);
-    if (!target_is_overridden(cfg, "/var/tmp")) {
-        target = join_under_root(root, "/var/tmp");
-        mount_tmpfs_with_options(target, "mode=1777");
-        free(target);
-    }
+    default_dir(cfg, root, "/var/tmp", 01777);
     default_symlink(cfg, root, "/run", "/var/run");
     default_symlink(cfg, root, "/run/lock", "/var/lock");
     default_dir(cfg, root, "/mnt", 0755);
 
     if (!target_is_overridden(cfg, cfg->home)) {
-        target = join_under_root(root, cfg->home);
-        mount_tmpfs_with_options(target, "mode=0700");
-        free(target);
+        char *parent;
 
+        target = join_under_root(root, cfg->home);
+        parent = parent_dir(target);
+        mkdir_p(parent, 0755);
+        free(parent);
+        free(target);
+        mkdir_inside(root, cfg->home, 0700);
         for (size_t i = 0; i < sizeof(home_dirs) / sizeof(home_dirs[0]); i++) {
             char *path = append_path(cfg->home, home_dirs[i]);
             mkdir_inside(root, path, 0700);
@@ -1724,14 +1910,13 @@ static int supervise_process(pid_t child, bool reap_orphans)
 
 static void setup_sandbox(const struct config *cfg, const char *root)
 {
-    if (mount("tmpfs", root, "tmpfs", MS_NOSUID | MS_NODEV, "mode=755") < 0)
-        die_errno("root tmpfs mount");
+    mount_tmpfs_at(root, cfg->tmpfs_size);
 
     if (!cfg->no_defaults)
         setup_default_filesystem(cfg, root);
 
     for (size_t i = 0; i < cfg->len; i++)
-        apply_op(root, &cfg->ops[i]);
+        apply_op(cfg, root, &cfg->ops[i]);
 
     ensure_stdio();
     close_extra_fds();
@@ -1744,10 +1929,12 @@ static void setup_sandbox(const struct config *cfg, const char *root)
         die_errno("chdir");
 
     setup_environment(cfg);
+    detach_session_keyring();
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
         die_errno("prctl(PR_SET_NO_NEW_PRIVS)");
     drop_caps();
+    install_tty_filter();
 }
 
 static void exec_command(char **cmd)
@@ -1759,12 +1946,47 @@ static void exec_command(char **cmd)
     die_errno(cmd[0]);
 }
 
+static void make_cloexec_pipe(int fds[2])
+{
+    if (pipe2(fds, O_CLOEXEC) < 0)
+        die_errno("pipe2");
+}
+
+/*
+ * Have the kernel SIGKILL this process when its parent exits, so killing
+ * microwrap cannot leave an orphaned wrapper running. parent_fd is the read
+ * end of a pipe whose write end only the parent holds; EOF on it means the
+ * parent exited before the death signal was armed.
+ */
+static void die_with_parent(int parent_fd)
+{
+    struct pollfd parent = { .fd = parent_fd, .events = POLLIN };
+    int ready;
+
+    if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) < 0)
+        die_errno("prctl(PR_SET_PDEATHSIG)");
+    do
+        ready = poll(&parent, 1, 0);
+    while (ready < 0 && errno == EINTR);
+    if (ready < 0)
+        die_errno("poll parent pipe");
+    if (ready > 0)
+        _exit(1);
+    close(parent_fd);
+}
+
 static int pid_namespace_main(const struct config *cfg, const char *root,
                               char **cmd)
 {
     pid_t pid;
 
     setup_sandbox(cfg, root);
+    /*
+     * Keep the wrapped command from ptracing its init, which could clear the
+     * parent death signal or stop the init from reaping the namespace.
+     */
+    if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
+        die_errno("prctl(PR_SET_DUMPABLE)");
     pid = fork_process();
     if (pid < 0)
         die_errno("fork command");
@@ -1777,6 +1999,7 @@ static int pid_namespace_main(const struct config *cfg, const char *root,
 static int child_main(const struct config *cfg, const char *root, char **cmd,
                       const struct network_sync *network_sync)
 {
+    int parent_pipe[2];
     pid_t pid;
 
     setup_namespaces(cfg, network_sync);
@@ -1785,13 +2008,18 @@ static int child_main(const struct config *cfg, const char *root, char **cmd,
         exec_command(cmd);
     }
 
+    /* The write end stays open here until this process exits. */
+    make_cloexec_pipe(parent_pipe);
     pid = fork_process();
     if (pid < 0)
         die_errno("fork PID namespace init");
     if (pid == 0) {
+        close(parent_pipe[1]);
+        die_with_parent(parent_pipe[0]);
         pending_signal = 0;
         _exit(pid_namespace_main(cfg, root, cmd));
     }
+    close(parent_pipe[0]);
     restore_signal_mask();
     return supervise_process(pid, false);
 }
@@ -1822,12 +2050,6 @@ struct network_helper {
     pid_t pid;
     int exit_fd;
 };
-
-static void make_cloexec_pipe(int fds[2])
-{
-    if (pipe2(fds, O_CLOEXEC) < 0)
-        die_errno("pipe2");
-}
 
 static bool read_readiness_byte(int fd, pid_t sandbox)
 {
@@ -1892,7 +2114,39 @@ static void silence_network_helper(void)
     close(fd);
 }
 
-static bool launch_network_helper(pid_t sandbox, struct network_helper *helper)
+/*
+ * A NULL filter fails with EFAULT where seccomp filters are supported and with
+ * EINVAL where they are not, such as under qemu-user or Rosetta emulation.
+ */
+static bool seccomp_filters_supported(void)
+{
+    return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, NULL, 0, 0) < 0 &&
+           errno == EFAULT;
+}
+
+/*
+ * slirp4netns --enable-sandbox needs UID 0 mapped in the wrapper's user
+ * namespace, which only holds for root callers, and keeps only /etc and /run
+ * from the host, so /etc/resolv.conf must resolve inside one of them.
+ */
+static bool network_helper_can_sandbox(const struct config *cfg)
+{
+    char *resolv;
+    bool supported;
+
+    if (cfg->uid != 0)
+        return false;
+    resolv = realpath("/etc/resolv.conf", NULL);
+    if (!resolv)
+        return errno == ENOENT;
+    supported = strncmp(resolv, "/etc/", 5) == 0 ||
+                strncmp(resolv, "/run/", 5) == 0;
+    free(resolv);
+    return supported;
+}
+
+static bool launch_network_helper(const struct config *cfg, pid_t sandbox,
+                                  struct network_helper *helper)
 {
     int ready_pipe[2];
     int exit_pipe[2];
@@ -1905,16 +2159,22 @@ static bool launch_network_helper(pid_t sandbox, struct network_helper *helper)
         die_errno("fork slirp4netns");
     if (pid == 0) {
         char target[64];
-        char *args[] = {
-            (char *)"slirp4netns",
-            (char *)"--configure",
-            (char *)"--disable-host-loopback",
-            (char *)"--ready-fd=3",
-            (char *)"--exit-fd=4",
-            target,
-            (char *)"tap0",
-            NULL,
-        };
+        char *args[10];
+        size_t argn = 0;
+
+        /* slirp4netns parses untrusted packets outside the wrapper. */
+        args[argn++] = (char *)"slirp4netns";
+        args[argn++] = (char *)"--configure";
+        args[argn++] = (char *)"--disable-host-loopback";
+        if (seccomp_filters_supported())
+            args[argn++] = (char *)"--enable-seccomp";
+        if (network_helper_can_sandbox(cfg))
+            args[argn++] = (char *)"--enable-sandbox";
+        args[argn++] = (char *)"--ready-fd=3";
+        args[argn++] = (char *)"--exit-fd=4";
+        args[argn++] = target;
+        args[argn++] = (char *)"tap0";
+        args[argn] = NULL;
 
         prepare_helper_fds(ready_pipe[1], exit_pipe[0]);
         restore_forward_signal_handlers();
@@ -1999,6 +2259,7 @@ int main(int argc, char **argv)
     struct network_sync child_network_sync = { .ready_fd = -1, .gate_fd = -1 };
     int network_ready_pipe[2] = { -1, -1 };
     int network_gate_pipe[2] = { -1, -1 };
+    int parent_pipe[2];
     char **cmd;
     char *root;
     pid_t pid;
@@ -2013,6 +2274,8 @@ int main(int argc, char **argv)
         make_cloexec_pipe(network_ready_pipe);
         make_cloexec_pipe(network_gate_pipe);
     }
+    /* The write end stays open here until this process exits. */
+    make_cloexec_pipe(parent_pipe);
     install_forward_signal_handlers();
     pid = fork_process();
 
@@ -2021,6 +2284,8 @@ int main(int argc, char **argv)
 
     if (pid == 0) {
         pending_signal = 0;
+        close(parent_pipe[1]);
+        die_with_parent(parent_pipe[0]);
         block_forward_signals();
         if (cfg.network == NETWORK_INTERNET) {
             close(network_ready_pipe[0]);
@@ -2032,6 +2297,7 @@ int main(int argc, char **argv)
                          cfg.network == NETWORK_INTERNET
                              ? &child_network_sync : NULL));
     }
+    close(parent_pipe[0]);
 
     if (cfg.network == NETWORK_INTERNET) {
         bool namespace_ready;
@@ -2043,7 +2309,7 @@ int main(int argc, char **argv)
         if (!namespace_ready) {
             close(network_gate_pipe[1]);
             status = wait_for_process(pid);
-        } else if (!launch_network_helper(pid, &network_helper)) {
+        } else if (!launch_network_helper(&cfg, pid, &network_helper)) {
             kill_blocked_sandbox(pid);
             close(network_gate_pipe[1]);
             status = 1;
@@ -2055,6 +2321,7 @@ int main(int argc, char **argv)
         status = supervise_process(pid, false);
     }
     restore_forward_signal_handlers();
+    close(parent_pipe[1]);
 
     if (rmdir(root) < 0)
         warn_remove(root);

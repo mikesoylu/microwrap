@@ -18,11 +18,16 @@ tmp=$(mktemp -d)
 outside_pid=
 wrapper_pid=
 listener_pid=
+pty_holder_pid=
+ipc_key=
+isolation_test="$tmp/test-isolation"
 cleanup()
 {
     [ -z "$wrapper_pid" ] || kill "$wrapper_pid" 2>/dev/null || true
     [ -z "$listener_pid" ] || kill "$listener_pid" 2>/dev/null || true
     [ -z "$outside_pid" ] || kill "$outside_pid" 2>/dev/null || true
+    [ -z "$pty_holder_pid" ] || kill "$pty_holder_pid" 2>/dev/null || true
+    [ -z "$ipc_key" ] || "$isolation_test" shm remove "$ipc_key" 2>/dev/null || true
     rm -rf "$tmp"
 }
 trap cleanup EXIT INT HUP TERM
@@ -31,6 +36,23 @@ caller_gid=$(id -g)
 network_test="$tmp/test-network"
 ${CC:-cc} ${CFLAGS:--O2 -Wall -Wextra -Werror -std=c11} \
     -o "$network_test" "$script_dir/test-network.c"
+${CC:-cc} ${CFLAGS:--O2 -Wall -Wextra -Werror -std=c11} \
+    -o "$isolation_test" "$script_dir/test-isolation.c"
+
+# True while PID exists and is not a zombie.
+process_alive()
+{
+    state=$(sed -n 's/^State:[[:space:]]*\([A-Z]\).*/\1/p' \
+        "/proc/$1/status" 2>/dev/null) || return 1
+    [ -n "$state" ] && [ "$state" != Z ] && [ "$state" != X ]
+}
+
+first_child()
+{
+    # shellcheck disable=SC2046
+    set -- $(cat "/proc/$1/task/$1/children" 2>/dev/null || true)
+    echo "${1:-}"
+}
 
 base_args='--ro-bind /bin /bin --ro-bind /usr /usr --ro-bind /lib /lib'
 if [ -e /lib64 ]; then
@@ -166,6 +188,56 @@ if kill -0 "$descendant_pid" 2>/dev/null; then
     echo "descendant survived namespace init exit" >&2
     exit 1
 fi
+
+"$WRAP" -- /bin/sh -c '
+    if cat /proc/1/environ >/dev/null 2>&1; then
+        echo "wrapped command can inspect its init" >&2
+        exit 1
+    fi
+'
+
+echo "wrapper dies with microwrap"
+for share_pid in "" --share-pid; do
+    # A killed microwrap cannot remove its temporary root; keep it in $tmp.
+    # shellcheck disable=SC2086
+    XDG_RUNTIME_DIR=$tmp "$WRAP" $share_pid -- /bin/sleep 300 &
+    wrapper_pid=$!
+    chain=
+    i=0
+    while [ "$i" -lt 100 ]; do
+        chain=
+        last=
+        pid=$wrapper_pid
+        while :; do
+            pid=$(first_child "$pid")
+            [ -n "$pid" ] || break
+            chain="$chain $pid"
+            last=$pid
+        done
+        if [ -n "$chain" ] &&
+            [ "$(cat "/proc/$last/comm" 2>/dev/null || true)" = sleep ]; then
+            break
+        fi
+        sleep 0.05
+        i=$((i + 1))
+    done
+    test -n "$last"
+    test "$(cat "/proc/$last/comm")" = sleep
+    kill -KILL "$wrapper_pid"
+    wait "$wrapper_pid" 2>/dev/null || true
+    wrapper_pid=
+    for pid in $chain; do
+        i=0
+        while process_alive "$pid" && [ "$i" -lt 100 ]; do
+            sleep 0.05
+            i=$((i + 1))
+        done
+        if process_alive "$pid"; then
+            echo "wrapper process $pid survived microwrap ($share_pid)" >&2
+            exit 1
+        fi
+    done
+done
 
 echo "network namespaces and isolated ports"
 host_network=$(readlink /proc/self/ns/net)
@@ -310,6 +382,7 @@ if command -v slirp4netns >/dev/null 2>&1; then
         i=$((i + 1))
     done
     test -n "$helper_pid"
+    test "$(sed -n 's/^Seccomp:[[:space:]]*//p' "/proc/$helper_pid/status")" = 2
     kill -TERM "$wrapper_pid"
     if wait "$wrapper_pid"; then
         internet_status=0
@@ -355,6 +428,113 @@ echo "proc, sys, and standard devices"
     test -c /proc/kcore
     test "$(stat -c %t:%T /proc/kcore)" = 1:3
 '
+
+echo "terminal input injection filter"
+test "$("$isolation_test" ioctl tiocsti </dev/null)" = ENOTTY
+"$WRAP" --ro-bind "$isolation_test" /iso -- /bin/sh -c '
+    set -eu
+    test "$(/iso ioctl tiocsti)" = EPERM
+    test "$(/iso ioctl tioclinux)" = EPERM
+    case "$(/iso ioctl tiocsti-high)" in EPERM|unsupported) ;; *) exit 1 ;; esac
+    test "$(/iso ioctl tiocgwinsz)" = ENOTTY
+' </dev/null
+# shellcheck disable=SC2086
+test "$("$WRAP" --no-defaults $base_args --ro-bind "$isolation_test" /iso \
+    -- /iso ioctl tiocsti </dev/null)" = EPERM
+if [ "$(uname -m)" = x86_64 ]; then
+    for abi in tiocsti-x32 tiocsti-x32-64; do
+        test "$("$WRAP" --ro-bind "$isolation_test" /iso \
+            -- /iso ioctl "$abi" </dev/null)" = EPERM
+    done
+    if [ "$("$isolation_test" ioctl tiocsti-i386 </dev/null 2>/dev/null || true)" = ENOTTY ]; then
+        test "$("$WRAP" --ro-bind "$isolation_test" /iso \
+            -- /iso ioctl tiocsti-i386 </dev/null)" = EPERM
+    else
+        echo "skipping i386 ABI filter test: IA-32 emulation unavailable" >&2
+    fi
+fi
+
+echo "private devpts instance"
+test "$("$WRAP" -- /bin/readlink /dev/ptmx)" = pts/ptmx
+if [ -c /dev/ptmx ] && [ -d /dev/pts ]; then
+    rm -f "$tmp/host-pty"
+    "$isolation_test" pty hold "$tmp/host-pty" &
+    pty_holder_pid=$!
+    i=0
+    while [ ! -s "$tmp/host-pty" ] && [ "$i" -lt 100 ]; do
+        sleep 0.01
+        i=$((i + 1))
+    done
+    test -s "$tmp/host-pty"
+    HOST_PTY=$(cat "$tmp/host-pty") HOST_PTS_DEV=$(stat -c %d /dev/pts) \
+        "$WRAP" --ro-bind "$isolation_test" /iso -- /bin/sh -c '
+            set -eu
+            test -e "$HOST_PTY" && exit 1
+            test "$(stat -c %d /dev/pts)" != "$HOST_PTS_DEV"
+            test "$(ls /dev/pts)" = ptmx
+            case "$(/iso pty open)" in /dev/pts/*) ;; *) exit 1 ;; esac
+        '
+    kill "$pty_holder_pid"
+    wait "$pty_holder_pid" 2>/dev/null || true
+    pty_holder_pid=
+    HOST_PTS_DEV=$(stat -c %d /dev/pts) \
+        "$WRAP" --bind /dev/pts /dev/pts -- /bin/sh -c '
+            test "$(stat -c %d /dev/pts)" = "$HOST_PTS_DEV"
+            test -c /dev/ptmx && test ! -L /dev/ptmx
+        '
+fi
+
+echo "private IPC namespace"
+host_ipc=$(readlink /proc/self/ns/ipc)
+test "$("$WRAP" -- /bin/readlink /proc/self/ns/ipc)" != "$host_ipc"
+test "$("$WRAP" --share-ipc -- /bin/readlink /proc/self/ns/ipc)" = "$host_ipc"
+ipc_key=$((1836543000 + $$ % 1000))
+"$isolation_test" shm create "$ipc_key"
+if "$WRAP" --ro-bind "$isolation_test" /iso -- /iso shm exists "$ipc_key"; then
+    echo "host SysV shared memory visible in wrapper" >&2
+    exit 1
+fi
+"$WRAP" --share-ipc --ro-bind "$isolation_test" /iso -- /iso shm exists "$ipc_key"
+"$isolation_test" shm remove "$ipc_key"
+ipc_key=
+
+echo "private session keyring"
+if "$isolation_test" keyring exec "$isolation_test" keyring check 2>/dev/null; then
+    if "$isolation_test" keyring exec "$WRAP" --ro-bind "$isolation_test" /iso \
+        -- /iso keyring check; then
+        keyring_status=0
+    else
+        keyring_status=$?
+    fi
+    test "$keyring_status" = 1
+else
+    echo "skipping keyring test: kernel keyrings unavailable" >&2
+fi
+
+echo "shared tmpfs size limit"
+"$WRAP" -- /bin/sh -c '
+    set -eu
+    root_dev=$(stat -c %d /)
+    for dir in /tmp /var/tmp /dev/shm /run "$HOME"; do
+        test "$(stat -c %d "$dir")" = "$root_dev"
+    done
+'
+"$WRAP" --tmpfs-size 1m --tmpfs /scratch -- /bin/sh -c '
+    set -eu
+    for dir in /tmp /scratch; do
+        if dd if=/dev/zero of="$dir/fill" bs=1024 count=2048 2>/dev/null; then
+            echo "$dir accepted more than its size limit" >&2
+            exit 1
+        fi
+        rm -f "$dir/fill"
+    done
+'
+for size in 0 00k "" 1x -1 "1m,uid=0" "1m "; do
+    if "$WRAP" --tmpfs-size "$size" -- /bin/true 2>/dev/null; then
+        echo "invalid --tmpfs-size '$size' unexpectedly accepted" >&2
+        exit 1
+    fi
+done
 
 echo "standard runtime directories"
 "$WRAP" -- /bin/sh -c '
